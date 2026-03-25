@@ -9,6 +9,23 @@ It is designed for a setup where:
 
 ---
 
+## Table of Contents
+- [What this tool does](#what-this-tool-does)
+  - [1) Backup](#1-backup)
+  - [2) Update](#2-update)
+  - [3) Close](#3-close)
+- [Requirements](#requirements)
+- [Files and directories used](#files-and-directories-used)
+- [How to use](#how-to-use)
+  - [Restore from a backup (manual)](#restore-from-a-backup-manual)
+- [Installation](#installation)
+  - [Install via install script (recommended)](#install-via-install-script-recommended)
+  - [Manual install (copy)](#manual-install-copy)
+- [Safety notes / best practices](#safety-notes--best-practices)
+- [Troubleshooting](#troubleshooting)
+
+---
+
 ## What this tool does
 
 ### 1) Backup
@@ -88,90 +105,3 @@ Created/used:
 Run the command (once installed):
 ```bash
 updater
-```
-
-You’ll see a menu:
-- `[1] Backup`
-- `[2] Update`
-- `[3] Close`
-
-### Restore from a backup (manual)
-To restore, you typically:
-1. Stop the stack:
-```bash
-cd /root
-docker compose down
-```
-
-2. Extract a backup tarball into `/root`:
-```bash
-cd /root
-tar -xzf /root/backup/pangolin-backup-YYYY-MM-DD_HH-MM-SS.tar.gz
-```
-
-3. Start the stack again:
-```bash
-cd /root
-docker compose up -d
-```
-
----
-
-## Installation
-
-### Install via install script (recommended)
-Assumptions:
-- Your main script file is named: `pangolin_updater`
-- You want the command name to be: `updater`
-
-1. Make the install script executable:
-```bash
-chmod +x install.sh
-```
-
-2. Run it as root:
-```bash
-sudo ./install.sh
-```
-
-3. Verify:
-```bash
-which updater
-updater
-```
-
-### Manual install (copy)
-If you prefer not to use `install.sh`:
-```bash
-sudo install -m 0755 ./pangolin_updater /usr/local/bin/updater
-```
-
----
-
-## Safety notes / best practices
-
-- The tool modifies `/root/docker-compose.yml`. It also creates a timestamped safety backup of the compose file before writing changes.
-- Always ensure you have a recent backup before changing versions.
-- Pruning images can remove old versions you may want to roll back to; keep backups if rollback matters.
-
----
-
-## Troubleshooting
-
-### “This tool must be run as root”
-Run with:
-```bash
-sudo updater
-```
-
-### “Missing /root/docker-compose.yml” or “Missing /root/config directory”
-Confirm your compose file and config folder exist and are in `/root`.
-
-### Docker commands fail
-Try running the same command manually to see the error, e.g.:
-```bash
-cd /root
-docker compose up -d
-```
-
-Then fix the underlying Docker/Compose problem (permissions, daemon status, invalid compose file, etc.).
