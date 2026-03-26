@@ -9,7 +9,6 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -21,7 +20,6 @@ ROOT_DIR = Path("/root")
 COMPOSE_FILE = ROOT_DIR / "docker-compose.yml"
 CONFIG_DIR = ROOT_DIR / "config"
 BACKUP_DIR = ROOT_DIR / "backup"
-BACKUP_PREFIX = "pangolin-backup-"
 BACKUP_RE = re.compile(r"^pangolin-backup-(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.tar\.gz$")
 
 @dataclass(frozen=True)
@@ -61,6 +59,8 @@ def handle_cli_flags():
 """)
         sys.exit(0)
 
+_stdout_lock = threading.Lock()
+
 def run(cmd, cwd=ROOT_DIR, label=None):
     """
     Run a command, streaming output, while showing a spinner + elapsed time.
@@ -80,19 +80,18 @@ def run(cmd, cwd=ROOT_DIR, label=None):
         while not stop_flag.is_set():
             elapsed = int(time.time() - start)
             msg = f"\r{frames[i % len(frames)]} {label}...  ({elapsed}s elapsed)"
-            # keep it on one line
-            sys.stdout.write(msg)
-            sys.stdout.flush()
+            with _stdout_lock:
+                sys.stdout.write(msg)
+                sys.stdout.flush()
             time.sleep(0.15)
             i += 1
-        # clear line when done
-        sys.stdout.write("\r" + " " * 80 + "\r")
-        sys.stdout.flush()
+        with _stdout_lock:
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
 
     t = threading.Thread(target=spinner, daemon=True)
     t.start()
 
-    # Stream stdout/stderr while spinner runs.
     p = subprocess.Popen(
         cmd,
         cwd=str(cwd),
@@ -102,14 +101,22 @@ def run(cmd, cwd=ROOT_DIR, label=None):
         bufsize=1,
     )
 
+    rc = 1
     try:
         for line in p.stdout:
-            # Stop spinner while printing line to avoid messy output, then restart it.
-            # (We just temporarily clear line; spinner thread keeps running.)
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            with _stdout_lock:
+                sys.stdout.write("\r" + " " * 80 + "\r")
+                sys.stdout.write(line)
+                sys.stdout.flush()
         rc = p.wait()
+    except Exception:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        raise
     finally:
         stop_flag.set()
         t.join(timeout=1)
@@ -171,6 +178,8 @@ def update_image_tag(compose_text, image_repo, new_tag):
     return new_text
 
 def classify_change(old_tag, new_tag):
+    if old_tag is None or new_tag is None:
+        return "N/A"
     if old_tag == new_tag:
         return "Unchanged"
     # Best-effort semantic-ish comparison:
@@ -337,6 +346,11 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
 
 def do_update():
     require_paths()
+
+    backup_ans = input("Take a backup before updating? (Y/N) [default: Y]: ").strip().lower()
+    if backup_ans in ("", "y", "yes"):
+        do_backup()
+
     compose_text = read_compose_text()
     current = parse_current_tags(compose_text)
 
@@ -371,8 +385,11 @@ def do_update():
     for key, meta in IMAGES.items():
         old = current.get(key)
         new = selections.get(key)
-        if old != new:
-            new_text = update_image_tag(new_text, meta["image_repo"], new)
+        if old != new and new is not None:
+            try:
+                new_text = update_image_tag(new_text, meta["image_repo"], new)
+            except RuntimeError as e:
+                print(f"Warning: {e} — skipping {meta['display']}.")
 
     write_compose_text(new_text)
 
@@ -405,6 +422,86 @@ def do_update():
         else:
             print("Unused images removed.")
 
+def do_restore():
+    backups = list_backups(BACKUP_DIR)
+    if not backups:
+        print(f"\nNo backups found in {BACKUP_DIR}.")
+        return
+
+    print("\nAvailable backups (oldest -> newest):")
+    for i, b in enumerate(backups, start=1):
+        print(f"  [{i}] {b.path.name}")
+
+    choice = input("\nEnter the number of the backup to restore (or blank to cancel): ").strip()
+    if choice == "":
+        print("Cancelled.")
+        return
+
+    if not choice.isdigit() or not (1 <= int(choice) <= len(backups)):
+        print("Invalid selection.")
+        return
+
+    selected = backups[int(choice) - 1]
+    print(f"\nSelected: {selected.path.name}")
+    print("WARNING: This will overwrite /root/docker-compose.yml and completely replace /root/config/.")
+    confirm = input("Type YES to confirm (there is no going back): ").strip()
+    if confirm != "YES":
+        print("Cancelled.")
+        return
+
+    tmp_dir = ROOT_DIR / f".restore_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    config_bak = ROOT_DIR / f".config_bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+
+        print(f"\nExtracting {selected.path.name} ...")
+        with tarfile.open(selected.path, "r:gz") as tar:
+            if hasattr(tarfile, 'data_filter'):
+                tar.extractall(path=tmp_dir, filter='data')
+            else:
+                tar.extractall(path=tmp_dir)
+
+        extracted_compose = tmp_dir / "docker-compose.yml"
+        extracted_config = tmp_dir / "config"
+
+        if not extracted_compose.exists():
+            print("ERROR: Backup does not contain docker-compose.yml. Aborting.")
+            return
+        if not extracted_config.exists() or not extracted_config.is_dir():
+            print("ERROR: Backup does not contain a config/ directory. Aborting.")
+            return
+
+        # Replace docker-compose.yml
+        shutil.copy2(extracted_compose, COMPOSE_FILE)
+        print(f"Restored: {COMPOSE_FILE}")
+
+        # Atomically stage the existing config aside before copying the backup in.
+        # rename() is atomic on the same filesystem — no window where config/ is absent.
+        if CONFIG_DIR.exists():
+            CONFIG_DIR.rename(config_bak)
+        try:
+            shutil.copytree(extracted_config, CONFIG_DIR)
+            if config_bak.exists():
+                shutil.rmtree(config_bak)
+        except Exception as e:
+            print(f"ERROR: Failed to copy restored config: {e}")
+            if config_bak.exists() and not CONFIG_DIR.exists():
+                config_bak.rename(CONFIG_DIR)
+                print("Rolled back: original config/ preserved.")
+            raise
+
+        print(f"Restored: {CONFIG_DIR}")
+
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        if config_bak.exists():
+            print(f"\nWARNING: Staged config backup still exists at {config_bak}")
+            print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
+
+    print("\nRestore complete. Run 'docker compose up -d' in /root to start the stack.")
+
+
 def main():
     handle_cli_flags()
     require_root()
@@ -413,7 +510,8 @@ def main():
         print(f"\n=== Pangolin Maintenance Tool v{__version__} ===")
         print("[1] Backup")
         print("[2] Update")
-        print("[3] Close")
+        print("[3] Restore")
+        print("[4] Close")
         choice = input("Select an option: ").strip()
 
         if choice == "1":
@@ -421,6 +519,8 @@ def main():
         elif choice == "2":
             do_update()
         elif choice == "3":
+            do_restore()
+        elif choice == "4":
             print("Bye.")
             return
         else:
