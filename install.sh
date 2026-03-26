@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ---- Config (edit these for your repo) ----
-OWNER="YOUR_GITHUB_OWNER"
-REPO="YOUR_REPO_NAME"
+OWNER="davetech-dev"
+REPO="Pangolin-Updater"
 BRANCH="main"
 SCRIPT_PATH_IN_REPO="pangolin_updater"   # file in repo root
 DEST="/usr/local/bin/updater"
