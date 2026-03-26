@@ -231,6 +231,23 @@ def do_backup():
     kept, deleted = apply_backup_retention(BACKUP_DIR)
     print(f"Retention done. Kept: {len(kept)}  Deleted: {len(deleted)}")
 
+    cleanup_baks = input("\nCleanup all docker-compose .bak files in /root now? (Y/N) [default: N]: ").strip().lower()
+    if cleanup_baks in ("y", "yes"):
+        removed = cleanup_compose_bak_files()
+        print(f"Removed compose backups: {removed}")
+
+def cleanup_compose_bak_files() -> int:
+    pattern = "docker-compose.yml.bak.*"
+    removed = 0
+    for p in ROOT_DIR.glob(pattern):
+        if p.is_file():
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as e:
+                print(f"Warning: failed to delete {p}: {e}")
+    return removed
+
 def list_backups(backup_dir: Path) -> list[BackupFile]:
     items: list[BackupFile] = []
     if not backup_dir.exists():
