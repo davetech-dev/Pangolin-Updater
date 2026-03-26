@@ -5,7 +5,7 @@ set -euo pipefail
 OWNER="davetech-dev"
 REPO="Pangolin-Updater"
 BRANCH="main"
-SCRIPT_PATH_IN_REPO="pangolin_updater"   # file in repo root
+SCRIPT_PATH_IN_REPO="pangolin_updater.py"   # file in repo root
 DEST="/usr/local/bin/updater"
 # ------------------------------------------
 
