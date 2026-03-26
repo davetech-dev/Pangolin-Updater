@@ -13,6 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from datetime import datetime, timedelta
 
+__app_name__ = "pangolin-updater"
+__version__ = "0.1.0"
+
+
 ROOT_DIR = Path("/root")
 COMPOSE_FILE = ROOT_DIR / "docker-compose.yml"
 CONFIG_DIR = ROOT_DIR / "config"
@@ -40,6 +44,22 @@ IMAGES = {
         "image_repo": "traefik",
     },
 }
+
+def handle_cli_flags():
+    if len(sys.argv) <= 1:
+        return
+
+    if sys.argv[1] in ("--version", "-V"):
+        print(f"{__app_name__} {__version__}")
+        sys.exit(0)
+
+    if sys.argv[1] in ("--help", "-h"):
+        print(f"""Usage:
+  updater              Run interactive menu
+  updater --version    Show version
+  updater --help       Show help
+""")
+        sys.exit(0)
 
 def run(cmd, cwd=ROOT_DIR, label=None):
     """
@@ -386,10 +406,11 @@ def do_update():
             print("Unused images removed.")
 
 def main():
+    handle_cli_flags()
     require_root()
 
     while True:
-        print("\n=== Pangolin Maintenance Tool ===")
+        print(f"\n=== Pangolin Maintenance Tool v{__version__} ===")
         print("[1] Backup")
         print("[2] Update")
         print("[3] Close")
