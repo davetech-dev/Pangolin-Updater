@@ -548,11 +548,18 @@ def do_update():
         selections[key] = select_release_tag(meta, old)
 
     print("\nPlanned changes:")
+    any_changes = False
     for key, meta in IMAGES.items():
         old = current.get(key)
         new = selections.get(key)
         change = classify_change(old, new)
         print(f"- {meta['display']}: {old} -> {new}  ({change})")
+        if old != new:
+            any_changes = True
+
+    if not any_changes:
+        print("\nNo version changes selected. Nothing to do.")
+        return
 
     ans = input("\nProceed? (Y/N) [default: N]: ").strip().lower()
     if ans not in ("y", "yes"):
