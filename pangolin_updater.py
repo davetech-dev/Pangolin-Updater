@@ -628,6 +628,11 @@ def do_restore():
         print("Cancelled.")
         return
 
+    rc = run(["docker", "compose", "down"], cwd=ROOT_DIR)
+    if rc != 0:
+        print("docker compose down failed; aborting restore.")
+        sys.exit(rc)
+
     tmp_dir = ROOT_DIR / f".restore_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     config_bak = ROOT_DIR / f".config_bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     try:
@@ -678,7 +683,12 @@ def do_restore():
             print(f"\nWARNING: Staged config backup still exists at {config_bak}")
             print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
 
-    print("\nRestore complete. Run 'docker compose up -d' in /root to start the stack.")
+    rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
+    if rc != 0:
+        print("docker compose up -d failed after restore.")
+        sys.exit(rc)
+
+    print("\nRestore complete. Stack restarted.")
 
 
 def main():
