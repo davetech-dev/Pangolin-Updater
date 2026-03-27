@@ -119,7 +119,7 @@ def run(cmd, cwd=ROOT_DIR, label=None):
                 sys.stdout.write(line)
                 sys.stdout.flush()
         rc = p.wait()
-    except Exception:
+    except BaseException:
         p.terminate()
         try:
             p.wait(timeout=5)
@@ -285,6 +285,32 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
             continue
         tags.append(tag)
     return tags
+
+def safe_extract_tar(tar, destination: Path):
+    """
+    Extract tar safely.
+    - Python 3.12+: use filter='data'.
+    - Older Python: ensure each member resolves inside destination.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(path=destination, filter="data")
+        return
+
+    base_dir = destination.resolve()
+    safe_members = []
+    for member in tar.getmembers():
+        dest_path = (base_dir / member.name).resolve()
+        try:
+            dest_path.relative_to(base_dir)
+        except ValueError:
+            print(f"Skipping potentially unsafe path in tar archive: {member.name}")
+            continue
+        safe_members.append(member)
+
+    for member in safe_members:
+        tar.extract(member, path=base_dir)
 
 def select_release_tag(meta, current_tag):
     display = meta["display"]
@@ -635,11 +661,6 @@ def do_restore():
         print("Cancelled.")
         return
 
-    rc = run(["docker", "compose", "down"], cwd=ROOT_DIR)
-    if rc != 0:
-        print("docker compose down failed; aborting restore.")
-        sys.exit(rc)
-
     tmp_dir = ROOT_DIR / f".restore_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     config_bak = ROOT_DIR / f".config_bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     try:
@@ -647,10 +668,7 @@ def do_restore():
 
         print(f"\nExtracting {selected.path.name} ...")
         with tarfile.open(selected.path, "r:gz") as tar:
-            if hasattr(tarfile, 'data_filter'):
-                tar.extractall(path=tmp_dir, filter='data')
-            else:
-                tar.extractall(path=tmp_dir)
+            safe_extract_tar(tar, tmp_dir)
 
         extracted_compose = tmp_dir / "docker-compose.yml"
         extracted_config = tmp_dir / "config"
@@ -661,6 +679,12 @@ def do_restore():
         if not extracted_config.exists() or not extracted_config.is_dir():
             print("ERROR: Backup does not contain a config/ directory. Aborting.")
             return
+
+        # Preflight succeeded; now stop the stack and perform restore.
+        rc = run(["docker", "compose", "down"], cwd=ROOT_DIR)
+        if rc != 0:
+            print("docker compose down failed; aborting restore.")
+            sys.exit(rc)
 
         # Replace docker-compose.yml
         shutil.copy2(extracted_compose, COMPOSE_FILE)
