@@ -23,24 +23,6 @@ ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_CYAN = "\033[36m"
 
-ASCII_BANNER_WIDE = r"""
-  ____                            _ _       _   _           _       _            
- |  _ \ __ _ _ __   __ _  ___ __| (_)_ __ | | | |_ __   __| | __ _| |_ ___ _ __ 
- | |_) / _` | '_ \ / _` |/ _ / _` | | '_ \| | | | '_ \ / _` |/ _` | __/ _ | '__|
- |  __/ (_| | | | | (_| |  __ (_| | | | | | |_| | |_) | (_| | (_| | ||  __| |   
- |_|   \__,_|_| |_|\__, |\___\__,_|_|_| |_|\___/| .__/ \__,_|\__,_|\__\___|_|   
-                   |___/                         |_|                               
-"""
-
-ASCII_BANNER_COMPACT = r"""
-    ____                        _ _       _       _       _            
- |  _ \ __ _ _ __   __ _ ___ (_|_)_ __ | | ___ | |_ ___| |__  _   _  
- | |_) / _` | '_ \ / _` / _ \| | | '_ \| |/ _ \| __/ __| '_ \| | | | 
- |  __/ (_| | | | | (_| | (_) | | | | | | | (_) | || (__| | | | |_| | 
- |_|   \__,_|_| |_|\__, |\___/|_|_|_| |_|_|\___/ \__\___|_| |_|\__,_| 
-                                     |___/                                                
-"""
-
 
 def ui_text(text, color=None, bold=False):
     if not IS_TTY:
@@ -72,19 +54,15 @@ def clear_screen():
 def print_banner():
     width = max(50, min(term_width(), 110))
     line = "=" * width
-    banner = ASCII_BANNER_WIDE if width >= 90 else ASCII_BANNER_COMPACT
     print(line)
-    print(ui_text(banner.strip("\n"), color=ANSI_CYAN, bold=True))
-    print(ui_text(f"{__app_name__} v{__version__}", bold=True))
+    print(ui_text(f" {__app_name__} v{__version__} ".center(width), color=ANSI_CYAN, bold=True))
     print(line)
 
 
 def print_section(title):
     width = max(50, min(term_width(), 110))
-    line = "-" * width
-    print(line)
     print(ui_text(title, bold=True))
-    print(line)
+    print("-" * min(width, max(len(title), 24)))
 
 
 def render_screen(title):
