@@ -235,16 +235,26 @@ def parse_version_tuple(tag):
         return None
     return tuple(int(p) for p in parts)
 
-def is_upgrade_version(current_tag, candidate_tag):
-    current_v = parse_version_tuple(current_tag)
-    candidate_v = parse_version_tuple(candidate_tag)
-    if current_v is None or candidate_v is None:
-        return False
+def compare_versions(tag_a, tag_b):
+    a = parse_version_tuple(tag_a)
+    b = parse_version_tuple(tag_b)
+    if a is None or b is None:
+        return 0
 
-    max_len = max(len(current_v), len(candidate_v))
-    current_padded = current_v + (0,) * (max_len - len(current_v))
-    candidate_padded = candidate_v + (0,) * (max_len - len(candidate_v))
-    return candidate_padded > current_padded
+    max_len = max(len(a), len(b))
+    a_pad = a + (0,) * (max_len - len(a))
+    b_pad = b + (0,) * (max_len - len(b))
+    if a_pad > b_pad:
+        return 1
+    if a_pad < b_pad:
+        return -1
+    return 0
+
+def style_current_tag(tag):
+    # Use ANSI bold when writing to a TTY; fallback keeps output readable in logs.
+    if sys.stdout.isatty():
+        return f"\033[1m{tag}\033[0m"
+    return f"**{tag}**"
 
 def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
     url = f"https://api.github.com/repos/{github_repo}/releases?per_page={per_page}"
@@ -271,41 +281,85 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
         tags.append(tag)
     return tags
 
-def show_available_upgrades(current_tags):
-    print("\nChecking GitHub releases for upgrade candidates...")
+def select_release_tag(meta, current_tag):
+    display = meta["display"]
+    github_repo = meta.get("github_repo")
 
-    for key, meta in IMAGES.items():
-        display = meta["display"]
-        current_tag = current_tags.get(key)
-        github_repo = meta.get("github_repo")
+    if current_tag is None:
+        val = input(f"Enter {display} version tag to pin (current not detected) [leave blank to keep]: ").strip()
+        return val if val else current_tag
 
-        if not github_repo:
-            print(f"- {display}: release source not configured")
+    print(f"\n{display} versions:")
+    print(f"  [0] {style_current_tag(current_tag)} (Current)")
+
+    if not github_repo:
+        print("  Release source not configured.")
+        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
+        if val == "":
+            return current_tag
+        return val
+
+    try:
+        release_tags = fetch_github_release_tags(github_repo)
+    except urllib.error.URLError as e:
+        print(f"  Failed to fetch releases: {e}")
+        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
+        if val == "":
+            return current_tag
+        return val
+    except Exception as e:
+        print(f"  Failed to parse releases: {e}")
+        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
+        if val == "":
+            return current_tag
+        return val
+
+    # Keep unique semver-like tags only.
+    unique_tags = []
+    seen = set()
+    for tag in release_tags:
+        if tag in seen:
             continue
-
-        if current_tag is None:
-            print(f"- {display}: current tag not detected; cannot determine upgrades")
+        if parse_version_tuple(tag) is None:
             continue
+        seen.add(tag)
+        unique_tags.append(tag)
 
-        try:
-            release_tags = fetch_github_release_tags(github_repo)
-        except urllib.error.URLError as e:
-            print(f"- {display}: failed to fetch releases ({e})")
-            continue
-        except Exception as e:
-            print(f"- {display}: failed to parse releases ({e})")
-            continue
+    upgrades = [t for t in unique_tags if compare_versions(t, current_tag) > 0]
+    downgrades = [t for t in unique_tags if compare_versions(t, current_tag) < 0]
 
-        upgrades = [tag for tag in release_tags if is_upgrade_version(current_tag, tag)]
-        if not upgrades:
-            print(f"- {display} (current: {current_tag}): no newer stable releases found")
-            continue
+    # Sort upgrades newest first.
+    upgrades.sort(key=lambda t: parse_version_tuple(t), reverse=True)
 
-        shown = upgrades[:10]
-        suffix = ""
-        if len(upgrades) > len(shown):
-            suffix = f" ... (+{len(upgrades) - len(shown)} more)"
-        print(f"- {display} (current: {current_tag}): {', '.join(shown)}{suffix}")
+    # Keep only one downgrade: nearest lower version.
+    one_downgrade = None
+    if downgrades:
+        one_downgrade = max(downgrades, key=lambda t: parse_version_tuple(t))
+
+    option_map = {0: current_tag}
+    idx = 1
+    for tag in upgrades:
+        option_map[idx] = tag
+        print(f"  [{idx}] {tag} (Upgrade)")
+        idx += 1
+
+    if one_downgrade is not None:
+        option_map[idx] = one_downgrade
+        print(f"  [{idx}] {one_downgrade} (Downgrade)")
+
+    if len(option_map) == 1:
+        print("  No stable upgrades found; keeping current is recommended.")
+
+    val = input("Choose version number [default: 0], or type tag manually: ").strip()
+    if val == "":
+        return current_tag
+    if val.isdigit():
+        pick = int(val)
+        if pick in option_map:
+            return option_map[pick]
+        print("Invalid number; keeping current.")
+        return current_tag
+    return val
 
 def do_backup():
     require_paths()
@@ -468,17 +522,12 @@ def do_update():
         print("Warning: Could not detect one or more image tags from docker-compose.yml.")
         print("Detected tags:", current)
 
-    show_available_upgrades(current)
+    print("\nChecking GitHub releases and preparing version choices...")
 
     selections = {}
     for key, meta in IMAGES.items():
         old = current.get(key)
-        prompt = f"Enter {meta['display']} version tag to pin (current: {old}) [leave blank to keep]: "
-        val = input(prompt).strip()
-        if val == "":
-            selections[key] = old
-        else:
-            selections[key] = val
+        selections[key] = select_release_tag(meta, old)
 
     print("\nPlanned changes:")
     for key, meta in IMAGES.items():
