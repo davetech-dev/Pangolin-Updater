@@ -683,7 +683,10 @@ def do_restore():
     restore_tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}"
     tmp_dir = ROOT_DIR / f".restore_tmp_{restore_tag}"
     config_bak = ROOT_DIR / f".config_bak_{restore_tag}"
+    compose_bak = ROOT_DIR / f".compose_bak_{restore_tag}.yml"
     stack_stopped = False
+    compose_replaced = False
+    compose_rolled_back = False
     try:
         tmp_dir.mkdir(parents=True, exist_ok=False)
 
@@ -708,8 +711,10 @@ def do_restore():
             sys.exit(rc)
         stack_stopped = True
 
-        # Replace docker-compose.yml
+        # Stage and replace docker-compose.yml
+        shutil.copy2(COMPOSE_FILE, compose_bak)
         shutil.copy2(extracted_compose, COMPOSE_FILE)
+        compose_replaced = True
         print(f"Restored: {COMPOSE_FILE}")
 
         # Atomically stage the existing config aside before copying the backup in.
@@ -737,11 +742,27 @@ def do_restore():
                     print("Rolled back: original config/ preserved.")
                 except Exception as restore_err:
                     print(f"WARNING: Failed to restore original config from backup: {restore_err}")
+
+            if compose_replaced and compose_bak.exists():
+                try:
+                    shutil.copy2(compose_bak, COMPOSE_FILE)
+                    compose_rolled_back = True
+                    print("Rolled back: original docker-compose.yml preserved.")
+                except Exception as compose_restore_err:
+                    print(f"WARNING: Failed to restore original docker-compose.yml: {compose_restore_err}")
             raise
 
         print(f"Restored: {CONFIG_DIR}")
 
     except BaseException:
+        if compose_replaced and not compose_rolled_back and compose_bak.exists():
+            try:
+                shutil.copy2(compose_bak, COMPOSE_FILE)
+                compose_rolled_back = True
+                print("Rolled back: original docker-compose.yml preserved.")
+            except Exception as compose_restore_err:
+                print(f"WARNING: Failed to restore original docker-compose.yml: {compose_restore_err}")
+
         if stack_stopped:
             print("\nRestore failed after stack was stopped. Attempting to start services again...")
             up_rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
@@ -758,6 +779,11 @@ def do_restore():
         if config_bak.exists():
             print(f"\nWARNING: Staged config backup still exists at {config_bak}")
             print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
+        if compose_bak.exists():
+            try:
+                compose_bak.unlink()
+            except Exception as e:
+                print(f"\nWARNING: Failed to remove staged compose backup {compose_bak}: {e}")
 
     if not stack_stopped:
         return
