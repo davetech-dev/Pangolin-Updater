@@ -685,6 +685,7 @@ def do_restore():
     config_bak = ROOT_DIR / f".config_bak_{restore_tag}"
     compose_bak = ROOT_DIR / f".compose_bak_{restore_tag}.yml"
     stack_stopped = False
+    config_staged = False
     compose_replaced = False
     compose_rolled_back = False
     try:
@@ -711,8 +712,10 @@ def do_restore():
             sys.exit(rc)
         stack_stopped = True
 
-        # Stage and replace docker-compose.yml
-        shutil.copy2(COMPOSE_FILE, compose_bak)
+        # Stage and replace docker-compose.yml. If no compose exists yet,
+        # restore can still proceed but rollback for compose is unavailable.
+        if COMPOSE_FILE.exists():
+            shutil.copy2(COMPOSE_FILE, compose_bak)
         shutil.copy2(extracted_compose, COMPOSE_FILE)
         compose_replaced = True
         print(f"Restored: {COMPOSE_FILE}")
@@ -721,13 +724,9 @@ def do_restore():
         # rename() is atomic on the same filesystem — no window where config/ is absent.
         if CONFIG_DIR.exists():
             CONFIG_DIR.rename(config_bak)
+            config_staged = True
         try:
             shutil.copytree(extracted_config, CONFIG_DIR)
-            if config_bak.exists():
-                try:
-                    shutil.rmtree(config_bak)
-                except Exception as cleanup_err:
-                    print(f"WARNING: Failed to remove staged backup directory {config_bak}: {cleanup_err}")
         except Exception as e:
             print(f"ERROR: Failed to copy restored config: {e}")
             # Attempt rollback: remove any partial restore, then put original back.
@@ -736,7 +735,7 @@ def do_restore():
                     shutil.rmtree(CONFIG_DIR)
                 except Exception as cleanup_err:
                     print(f"WARNING: Failed to remove partially restored config: {cleanup_err}")
-            if config_bak.exists():
+            if config_staged and config_bak.exists():
                 try:
                     config_bak.rename(CONFIG_DIR)
                     print("Rolled back: original config/ preserved.")
@@ -776,14 +775,6 @@ def do_restore():
                 shutil.rmtree(tmp_dir)
             except Exception as e:
                 print(f"\nWARNING: Failed to remove temporary restore directory {tmp_dir}: {e}")
-        if config_bak.exists():
-            print(f"\nWARNING: Staged config backup still exists at {config_bak}")
-            print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
-        if compose_bak.exists():
-            try:
-                compose_bak.unlink()
-            except Exception as e:
-                print(f"\nWARNING: Failed to remove staged compose backup {compose_bak}: {e}")
 
     if not stack_stopped:
         return
@@ -791,7 +782,42 @@ def do_restore():
     rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
     if rc != 0:
         print("docker compose up -d failed after restore.")
+
+        # Attempt rollback to pre-restore state when startup fails.
+        if CONFIG_DIR.exists() and config_staged and config_bak.exists():
+            try:
+                shutil.rmtree(CONFIG_DIR)
+                config_bak.rename(CONFIG_DIR)
+                print("Rolled back after startup failure: original config/ restored.")
+            except Exception as e:
+                print(f"WARNING: Failed to rollback config after startup failure: {e}")
+
+        if compose_replaced and compose_bak.exists():
+            try:
+                shutil.copy2(compose_bak, COMPOSE_FILE)
+                print("Rolled back after startup failure: original docker-compose.yml restored.")
+            except Exception as e:
+                print(f"WARNING: Failed to rollback docker-compose.yml after startup failure: {e}")
+
+        # Best-effort attempt to restart with rolled-back state.
+        retry_rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
+        if retry_rc != 0:
+            print("WARNING: Failed to restart stack after rollback attempt.")
+
         sys.exit(rc)
+
+    # Startup succeeded, cleanup staged backups.
+    if config_bak.exists():
+        try:
+            shutil.rmtree(config_bak)
+        except Exception as e:
+            print(f"\nWARNING: Failed to remove staged config backup {config_bak}: {e}")
+
+    if compose_bak.exists():
+        try:
+            compose_bak.unlink()
+        except Exception as e:
+            print(f"\nWARNING: Failed to remove staged compose backup {compose_bak}: {e}")
 
     print("\nRestore complete. Stack restarted.")
 
