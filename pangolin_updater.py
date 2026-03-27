@@ -258,7 +258,7 @@ def style_current_tag(tag):
     # Use ANSI bold when writing to a TTY; fallback keeps output readable in logs.
     if sys.stdout.isatty():
         return f"\033[1m{tag}\033[0m"
-    return f"{tag} (current)"
+    return tag
 
 def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
     url = f"https://api.github.com/repos/{github_repo}/releases?per_page={per_page}"
@@ -337,7 +337,7 @@ def select_release_tag(meta, current_tag):
         print("  Release source not configured.")
         print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val == "":
+        if val in ("", "0"):
             return current_tag
         return val
 
@@ -347,14 +347,14 @@ def select_release_tag(meta, current_tag):
         print(f"  Failed to fetch releases: {e}")
         print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val == "":
+        if val in ("", "0"):
             return current_tag
         return val
     except Exception as e:
         print(f"  Failed to parse releases: {e}")
         print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val == "":
+        if val in ("", "0"):
             return current_tag
         return val
 
@@ -740,7 +740,10 @@ def do_restore():
 
     finally:
         if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+            try:
+                shutil.rmtree(tmp_dir)
+            except Exception as e:
+                print(f"\nWARNING: Failed to remove temporary restore directory {tmp_dir}: {e}")
         if config_bak.exists():
             print(f"\nWARNING: Staged config backup still exists at {config_bak}")
             print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
