@@ -18,6 +18,80 @@ from datetime import datetime, timedelta
 __app_name__ = "pangolin-updater"
 __version__ = "0.1.2"
 
+IS_TTY = sys.stdout.isatty()
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_CYAN = "\033[36m"
+
+ASCII_BANNER_WIDE = r"""
+  ____                            _ _       _   _           _       _            
+ |  _ \ __ _ _ __   __ _  ___ __| (_)_ __ | | | |_ __   __| | __ _| |_ ___ _ __ 
+ | |_) / _` | '_ \ / _` |/ _ / _` | | '_ \| | | | '_ \ / _` |/ _` | __/ _ | '__|
+ |  __/ (_| | | | | (_| |  __ (_| | | | | | |_| | |_) | (_| | (_| | ||  __| |   
+ |_|   \__,_|_| |_|\__, |\___\__,_|_|_| |_|\___/| .__/ \__,_|\__,_|\__\___|_|   
+                   |___/                         |_|                               
+"""
+
+ASCII_BANNER_COMPACT = r"""
+    ____                        _ _       _       _       _            
+ |  _ \ __ _ _ __   __ _ ___ (_|_)_ __ | | ___ | |_ ___| |__  _   _  
+ | |_) / _` | '_ \ / _` / _ \| | | '_ \| |/ _ \| __/ __| '_ \| | | | 
+ |  __/ (_| | | | | (_| | (_) | | | | | | | (_) | || (__| | | | |_| | 
+ |_|   \__,_|_| |_|\__, |\___/|_|_|_| |_|_|\___/ \__\___|_| |_|\__,_| 
+                                     |___/                                                
+"""
+
+
+def ui_text(text, color=None, bold=False):
+    if not IS_TTY:
+        return text
+    parts = []
+    if bold:
+        parts.append(ANSI_BOLD)
+    if color:
+        parts.append(color)
+    parts.append(text)
+    parts.append(ANSI_RESET)
+    return "".join(parts)
+
+
+def term_width(default=80):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def clear_screen():
+    if IS_TTY:
+        # ANSI clear screen + move cursor to home.
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def print_banner():
+    width = max(50, min(term_width(), 110))
+    line = "=" * width
+    banner = ASCII_BANNER_WIDE if width >= 90 else ASCII_BANNER_COMPACT
+    print(line)
+    print(ui_text(banner.strip("\n"), color=ANSI_CYAN, bold=True))
+    print(ui_text(f"{__app_name__} v{__version__}", bold=True))
+    print(line)
+
+
+def print_section(title):
+    width = max(50, min(term_width(), 110))
+    line = "-" * width
+    print(line)
+    print(ui_text(title, bold=True))
+    print(line)
+
+
+def render_screen(title):
+    clear_screen()
+    print_banner()
+    print_section(title)
+
 
 ROOT_DIR = Path("/root")
 COMPOSE_FILE = ROOT_DIR / "docker-compose.yml"
@@ -79,7 +153,7 @@ def run(cmd, cwd=ROOT_DIR, label=None):
     if label is None:
         label = " ".join(cmd)
 
-    print(f"\n> {' '.join(cmd)} (cwd={cwd})")
+    print(f"\n[RUN] {' '.join(cmd)} (cwd={cwd})")
 
     start = time.time()
     stop_flag = threading.Event()
@@ -419,6 +493,7 @@ def select_release_tag(meta, current_tag):
     return val
 
 def do_backup():
+    render_screen("Backup")
     require_paths()
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -566,6 +641,7 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
 
 
 def do_update():
+    render_screen("Update")
     require_paths()
 
     backup_ans = input("Take a backup before updating? (Y/N) [default: Y]: ").strip().lower()
@@ -654,6 +730,7 @@ def do_update():
             print("Unused images removed.")
 
 def do_restore():
+    render_screen("Restore")
     backups = list_backups(BACKUP_DIR)
     if not backups:
         print(f"\nNo backups found in {BACKUP_DIR}.")
@@ -827,12 +904,12 @@ def main():
     require_root()
 
     while True:
-        print(f"\n=== Pangolin Maintenance Tool v{__version__} ===")
-        print("[1] Backup")
-        print("[2] Update")
-        print("[3] Restore")
+        render_screen("Main Menu")
+        print("[1] Backup stack and config")
+        print("[2] Update image versions")
+        print("[3] Restore from backup")
         print("[4] Close")
-        choice = input("Select an option: ").strip()
+        choice = input("Select an option [1-4]: ").strip()
 
         if choice == "1":
             do_backup()
