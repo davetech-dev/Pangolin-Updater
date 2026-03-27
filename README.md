@@ -1,7 +1,7 @@
 # Pangolin Updater (CLI)
 
 <p align="center">
-  <img src="https://github.com/davetech-dev/Pangolin-Updater/assets/banner.png" alt="Pangolin Updater banner" />
+  <img src="https://photos.neoapple.net/api/assets/6ce6e6aa-f070-47c0-bee8-d3ed843760e2/thumbnail?key=d4mlZbHHvdNNSpcTuA7HLd3FgPPZ-Re1NXXBjgpOZR_yJadG7mDZMeEoMuGCfoffqXY&size=preview&c=xgcGAYB5aIiMiAiIWp4AAAA%3D&edited=true" alt="Pangolin Updater banner" />
 </p>
 
 A CLI utility to manage a root-run Pangolin Docker Compose stack in `/root`.
