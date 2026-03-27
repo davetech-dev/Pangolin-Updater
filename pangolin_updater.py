@@ -7,6 +7,9 @@ import shutil
 import subprocess
 import threading
 import time
+import json
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,14 +35,17 @@ IMAGES = {
     "pangolin": {
         "display": "Pangolin",
         "image_repo": "fosrl/pangolin",
+        "github_repo": "fosrl/pangolin",
     },
     "gerbil": {
         "display": "Gerbil",
         "image_repo": "fosrl/gerbil",
+        "github_repo": "fosrl/gerbil",
     },
     "traefik": {
         "display": "Traefik",
         "image_repo": "traefik",
+        "github_repo": "traefik/traefik",
     },
 }
 
@@ -214,6 +220,93 @@ def classify_change(old_tag, new_tag):
         return "Downgrade"
     return "Unchanged"
 
+def parse_version_tuple(tag):
+    if not tag:
+        return None
+
+    t = tag.strip()
+    if t.startswith("v"):
+        t = t[1:]
+
+    # Ignore prerelease/build suffixes for basic semver comparison.
+    core = t.split("+", 1)[0].split("-", 1)[0]
+    parts = core.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+def is_upgrade_version(current_tag, candidate_tag):
+    current_v = parse_version_tuple(current_tag)
+    candidate_v = parse_version_tuple(candidate_tag)
+    if current_v is None or candidate_v is None:
+        return False
+
+    max_len = max(len(current_v), len(candidate_v))
+    current_padded = current_v + (0,) * (max_len - len(current_v))
+    candidate_padded = candidate_v + (0,) * (max_len - len(candidate_v))
+    return candidate_padded > current_padded
+
+def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
+    url = f"https://api.github.com/repos/{github_repo}/releases?per_page={per_page}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"{__app_name__}/{__version__}",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+
+    tags = []
+    for rel in payload:
+        tag = rel.get("tag_name")
+        if not tag:
+            continue
+        if rel.get("draft") or rel.get("prerelease"):
+            continue
+        if "-rc" in tag.lower():
+            continue
+        tags.append(tag)
+    return tags
+
+def show_available_upgrades(current_tags):
+    print("\nChecking GitHub releases for upgrade candidates...")
+
+    for key, meta in IMAGES.items():
+        display = meta["display"]
+        current_tag = current_tags.get(key)
+        github_repo = meta.get("github_repo")
+
+        if not github_repo:
+            print(f"- {display}: release source not configured")
+            continue
+
+        if current_tag is None:
+            print(f"- {display}: current tag not detected; cannot determine upgrades")
+            continue
+
+        try:
+            release_tags = fetch_github_release_tags(github_repo)
+        except urllib.error.URLError as e:
+            print(f"- {display}: failed to fetch releases ({e})")
+            continue
+        except Exception as e:
+            print(f"- {display}: failed to parse releases ({e})")
+            continue
+
+        upgrades = [tag for tag in release_tags if is_upgrade_version(current_tag, tag)]
+        if not upgrades:
+            print(f"- {display} (current: {current_tag}): no newer stable releases found")
+            continue
+
+        shown = upgrades[:10]
+        suffix = ""
+        if len(upgrades) > len(shown):
+            suffix = f" ... (+{len(upgrades) - len(shown)} more)"
+        print(f"- {display} (current: {current_tag}): {', '.join(shown)}{suffix}")
+
 def do_backup():
     require_paths()
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -374,6 +467,8 @@ def do_update():
     if any(v is None for v in current.values()):
         print("Warning: Could not detect one or more image tags from docker-compose.yml.")
         print("Detected tags:", current)
+
+    show_available_upgrades(current)
 
     selections = {}
     for key, meta in IMAGES.items():
