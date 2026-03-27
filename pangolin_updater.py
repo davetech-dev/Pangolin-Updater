@@ -258,7 +258,7 @@ def style_current_tag(tag):
     # Use ANSI bold when writing to a TTY; fallback keeps output readable in logs.
     if sys.stdout.isatty():
         return f"\033[1m{tag}\033[0m"
-    return f"**{tag}**"
+    return f"{tag} (current)"
 
 def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
     url = f"https://api.github.com/repos/{github_repo}/releases?per_page={per_page}"
@@ -301,6 +301,11 @@ def safe_extract_tar(tar, destination: Path):
     base_dir = destination.resolve()
     safe_members = []
     for member in tar.getmembers():
+        # Exclude links/dev nodes in fallback mode to avoid link-based escapes.
+        if member.issym() or member.islnk() or member.isdev():
+            print(f"Skipping unsupported tar member type: {member.name}")
+            continue
+
         dest_path = (base_dir / member.name).resolve()
         try:
             dest_path.relative_to(base_dir)
@@ -594,14 +599,20 @@ def do_update():
 
     # Apply updates
     new_text = compose_text
+    applied_changes = 0
     for key, meta in IMAGES.items():
         old = current.get(key)
         new = selections.get(key)
         if old != new and new is not None:
             try:
                 new_text = update_image_tag(new_text, meta["image_repo"], new)
+                applied_changes += 1
             except RuntimeError as e:
                 print(f"Warning: {e} — skipping {meta['display']}.")
+
+    if applied_changes == 0:
+        print("\nNo updates could be applied to docker-compose.yml. Skipping restart.")
+        return
 
     write_compose_text(new_text)
 
@@ -661,8 +672,10 @@ def do_restore():
         print("Cancelled.")
         return
 
-    tmp_dir = ROOT_DIR / f".restore_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    config_bak = ROOT_DIR / f".config_bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    restore_tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}"
+    tmp_dir = ROOT_DIR / f".restore_tmp_{restore_tag}"
+    config_bak = ROOT_DIR / f".config_bak_{restore_tag}"
+    stack_stopped = False
     try:
         tmp_dir.mkdir(parents=True, exist_ok=False)
 
@@ -685,6 +698,7 @@ def do_restore():
         if rc != 0:
             print("docker compose down failed; aborting restore.")
             sys.exit(rc)
+        stack_stopped = True
 
         # Replace docker-compose.yml
         shutil.copy2(extracted_compose, COMPOSE_FILE)
@@ -700,12 +714,29 @@ def do_restore():
                 shutil.rmtree(config_bak)
         except Exception as e:
             print(f"ERROR: Failed to copy restored config: {e}")
-            if config_bak.exists() and not CONFIG_DIR.exists():
-                config_bak.rename(CONFIG_DIR)
-                print("Rolled back: original config/ preserved.")
+            # Attempt rollback: remove any partial restore, then put original back.
+            if CONFIG_DIR.exists():
+                try:
+                    shutil.rmtree(CONFIG_DIR)
+                except Exception as cleanup_err:
+                    print(f"WARNING: Failed to remove partially restored config: {cleanup_err}")
+            if config_bak.exists():
+                try:
+                    config_bak.rename(CONFIG_DIR)
+                    print("Rolled back: original config/ preserved.")
+                except Exception as restore_err:
+                    print(f"WARNING: Failed to restore original config from backup: {restore_err}")
             raise
 
         print(f"Restored: {CONFIG_DIR}")
+
+    except BaseException:
+        if stack_stopped:
+            print("\nRestore failed after stack was stopped. Attempting to start services again...")
+            up_rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
+            if up_rc != 0:
+                print("WARNING: Failed to restart stack automatically after restore failure.")
+        raise
 
     finally:
         if tmp_dir.exists():
@@ -713,6 +744,9 @@ def do_restore():
         if config_bak.exists():
             print(f"\nWARNING: Staged config backup still exists at {config_bak}")
             print(f"  If config/ is absent, restore it manually: mv {config_bak} {CONFIG_DIR}")
+
+    if not stack_stopped:
+        return
 
     rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
     if rc != 0:
