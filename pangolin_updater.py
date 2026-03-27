@@ -36,16 +36,20 @@ IMAGES = {
         "display": "Pangolin",
         "image_repo": "fosrl/pangolin",
         "github_repo": "fosrl/pangolin",
+        "release_url": "https://github.com/fosrl/pangolin/releases",
+        "upgrade_note": "Recommended by maintainers: upgrade one version at a time, back up each step, and validate before moving to the next version.",
     },
     "gerbil": {
         "display": "Gerbil",
         "image_repo": "fosrl/gerbil",
         "github_repo": "fosrl/gerbil",
+        "release_url": "https://github.com/fosrl/gerbil/releases",
     },
     "traefik": {
         "display": "Traefik",
         "image_repo": "traefik",
         "github_repo": "traefik/traefik",
+        "release_url": "https://github.com/traefik/traefik/releases",
     },
 }
 
@@ -285,12 +289,18 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
 def select_release_tag(meta, current_tag):
     display = meta["display"]
     github_repo = meta.get("github_repo")
+    release_url = meta.get("release_url")
+    upgrade_note = meta.get("upgrade_note")
 
     if current_tag is None:
         val = input(f"Enter {display} version tag to pin (current not detected) [leave blank to keep]: ").strip()
         return val if val else current_tag
 
     print(f"\n{display} versions:")
+    if release_url:
+        print(f"  Releases: {release_url}")
+    if upgrade_note:
+        print(f"  NOTE: {upgrade_note}")
 
     if not github_repo:
         print("  Release source not configured.")
