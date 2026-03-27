@@ -696,4 +696,8 @@ def main():
             print("Invalid option.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCancelled by user.")
+        sys.exit(130)
