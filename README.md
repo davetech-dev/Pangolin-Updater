@@ -87,15 +87,22 @@ Menu:
 
 ## Installation
 
-### Install script (recommended)
+### One-line install (recommended)
 ```bash
-chmod +x install.sh
-sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/install.sh | sudo bash
 ```
 
 Force reinstall even when installed version is equal/newer:
 ```bash
-sudo ./install.sh --force
+curl -fsSL https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/install.sh | sudo bash -s -- --force
+```### One-line install (new users)
+```bash
+curl -fsSL https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/install.sh | sudo bash
+```
+
+Force reinstall even when installed version is equal/newer:
+```bash
+curl -fsSL https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/install.sh | sudo bash -s -- --force
 ```
 
 Verify:
