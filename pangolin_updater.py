@@ -719,7 +719,10 @@ def do_restore():
         try:
             shutil.copytree(extracted_config, CONFIG_DIR)
             if config_bak.exists():
-                shutil.rmtree(config_bak)
+                try:
+                    shutil.rmtree(config_bak)
+                except Exception as cleanup_err:
+                    print(f"WARNING: Failed to remove staged backup directory {config_bak}: {cleanup_err}")
         except Exception as e:
             print(f"ERROR: Failed to copy restored config: {e}")
             # Attempt rollback: remove any partial restore, then put original back.
