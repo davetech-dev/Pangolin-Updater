@@ -290,10 +290,10 @@ def select_release_tag(meta, current_tag):
         return val if val else current_tag
 
     print(f"\n{display} versions:")
-    print(f"  [0] {style_current_tag(current_tag)} (Current)")
 
     if not github_repo:
         print("  Release source not configured.")
+        print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
         if val == "":
             return current_tag
@@ -303,12 +303,14 @@ def select_release_tag(meta, current_tag):
         release_tags = fetch_github_release_tags(github_repo)
     except urllib.error.URLError as e:
         print(f"  Failed to fetch releases: {e}")
+        print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
         if val == "":
             return current_tag
         return val
     except Exception as e:
         print(f"  Failed to parse releases: {e}")
+        print(f"  [0] {style_current_tag(current_tag)} (Current)")
         val = input(f"Choose number [default: 0], or type tag manually: ").strip()
         if val == "":
             return current_tag
@@ -336,21 +338,26 @@ def select_release_tag(meta, current_tag):
     if downgrades:
         one_downgrade = max(downgrades, key=lambda t: parse_version_tuple(t))
 
-    option_map = {0: current_tag}
+    option_map = {}
     idx = 1
     for tag in upgrades:
         option_map[idx] = tag
         print(f"  [{idx}] {tag} (Upgrade)")
         idx += 1
 
+    current_idx = idx
+    option_map[current_idx] = current_tag
+    print(f"  [{current_idx}] {style_current_tag(current_tag)} (Current)")
+    idx += 1
+
     if one_downgrade is not None:
         option_map[idx] = one_downgrade
         print(f"  [{idx}] {one_downgrade} (Downgrade)")
 
-    if len(option_map) == 1:
+    if len(upgrades) == 0:
         print("  No stable upgrades found; keeping current is recommended.")
 
-    val = input("Choose version number [default: 0], or type tag manually: ").strip()
+    val = input(f"Choose version number [default: {current_idx}], or type tag manually: ").strip()
     if val == "":
         return current_tag
     if val.isdigit():
