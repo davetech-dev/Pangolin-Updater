@@ -16,7 +16,72 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 __app_name__ = "pangolin-updater"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
+
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_CYAN = "\033[36m"
+
+
+def is_tty():
+    return sys.stdout.isatty()
+
+
+def ui_text(text, color=None, bold=False):
+    if not is_tty():
+        return text
+    parts = []
+    if bold:
+        parts.append(ANSI_BOLD)
+    if color:
+        parts.append(color)
+    parts.append(text)
+    parts.append(ANSI_RESET)
+    return "".join(parts)
+
+
+def term_width(default=80):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def clear_screen():
+    if is_tty():
+        # ANSI clear screen + move cursor to home.
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def print_banner():
+    cols = term_width()
+    if cols < 50:
+        print(ui_text(f"{__app_name__} v{__version__}", color=ANSI_CYAN, bold=True))
+        return
+
+    width = min(cols, 110)
+    line = "=" * width
+    print(line)
+    print(ui_text(f" {__app_name__} v{__version__} ".center(width), color=ANSI_CYAN, bold=True))
+    print(line)
+
+
+def print_section(title):
+    cols = term_width()
+    width = min(cols, 110) if cols >= 50 else cols
+    print(ui_text(title, bold=True))
+    print("-" * max(1, min(width, max(len(title), 24))))
+
+
+def render_screen(title):
+    if not is_tty():
+        print(f"[{__app_name__} v{__version__}] {title}")
+        return
+
+    clear_screen()
+    print_banner()
+    print_section(title)
 
 
 ROOT_DIR = Path("/root")
@@ -79,7 +144,7 @@ def run(cmd, cwd=ROOT_DIR, label=None):
     if label is None:
         label = " ".join(cmd)
 
-    print(f"\n> {' '.join(cmd)} (cwd={cwd})")
+    print(f"\n[RUN] {' '.join(cmd)} (cwd={cwd})")
 
     start = time.time()
     stop_flag = threading.Event()
@@ -418,7 +483,9 @@ def select_release_tag(meta, current_tag):
         return current_tag
     return val
 
-def do_backup():
+def do_backup(render: bool = True):
+    if render:
+        render_screen("Backup")
     require_paths()
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -566,11 +633,12 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
 
 
 def do_update():
+    render_screen("Update")
     require_paths()
 
     backup_ans = input("Take a backup before updating? (Y/N) [default: Y]: ").strip().lower()
     if backup_ans in ("", "y", "yes"):
-        do_backup()
+        do_backup(render=False)
 
     compose_text = read_compose_text()
     current = parse_current_tags(compose_text)
@@ -654,6 +722,7 @@ def do_update():
             print("Unused images removed.")
 
 def do_restore():
+    render_screen("Restore")
     backups = list_backups(BACKUP_DIR)
     if not backups:
         print(f"\nNo backups found in {BACKUP_DIR}.")
@@ -827,12 +896,12 @@ def main():
     require_root()
 
     while True:
-        print(f"\n=== Pangolin Maintenance Tool v{__version__} ===")
-        print("[1] Backup")
-        print("[2] Update")
-        print("[3] Restore")
+        render_screen("Main Menu")
+        print("[1] Backup stack and config")
+        print("[2] Update image versions")
+        print("[3] Restore from backup")
         print("[4] Close")
-        choice = input("Select an option: ").strip()
+        choice = input("Select an option [1-4]: ").strip()
 
         if choice == "1":
             do_backup()
