@@ -18,14 +18,17 @@ from datetime import datetime, timedelta
 __app_name__ = "pangolin-updater"
 __version__ = "0.1.2"
 
-IS_TTY = sys.stdout.isatty()
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_CYAN = "\033[36m"
 
 
+def is_tty():
+    return sys.stdout.isatty()
+
+
 def ui_text(text, color=None, bold=False):
-    if not IS_TTY:
+    if not is_tty():
         return text
     parts = []
     if bold:
@@ -45,14 +48,19 @@ def term_width(default=80):
 
 
 def clear_screen():
-    if IS_TTY:
+    if is_tty():
         # ANSI clear screen + move cursor to home.
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
 
 
 def print_banner():
-    width = max(50, min(term_width(), 110))
+    cols = term_width()
+    if cols < 50:
+        print(ui_text(f"{__app_name__} v{__version__}", color=ANSI_CYAN, bold=True))
+        return
+
+    width = min(cols, 110)
     line = "=" * width
     print(line)
     print(ui_text(f" {__app_name__} v{__version__} ".center(width), color=ANSI_CYAN, bold=True))
@@ -60,12 +68,17 @@ def print_banner():
 
 
 def print_section(title):
-    width = max(50, min(term_width(), 110))
+    cols = term_width()
+    width = min(cols, 110) if cols >= 50 else cols
     print(ui_text(title, bold=True))
-    print("-" * min(width, max(len(title), 24)))
+    print("-" * max(1, min(width, max(len(title), 24))))
 
 
 def render_screen(title):
+    if not is_tty():
+        print(f"[{__app_name__} v{__version__}] {title}")
+        return
+
     clear_screen()
     print_banner()
     print_section(title)
