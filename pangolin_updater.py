@@ -276,7 +276,8 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
             continue
         if rel.get("draft") or rel.get("prerelease"):
             continue
-        if "-rc" in tag.lower():
+        tag_l = tag.lower()
+        if "-rc" in tag_l or "-ea" in tag_l:
             continue
         tags.append(tag)
     return tags
