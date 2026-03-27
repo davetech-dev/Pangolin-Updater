@@ -470,8 +470,9 @@ def select_release_tag(meta, current_tag):
         return current_tag
     return val
 
-def do_backup():
-    render_screen("Backup")
+def do_backup(render: bool = True):
+    if render:
+        render_screen("Backup")
     require_paths()
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -624,7 +625,7 @@ def do_update():
 
     backup_ans = input("Take a backup before updating? (Y/N) [default: Y]: ").strip().lower()
     if backup_ans in ("", "y", "yes"):
-        do_backup()
+        do_backup(render=False)
 
     compose_text = read_compose_text()
     current = parse_current_tags(compose_text)
