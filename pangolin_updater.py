@@ -99,9 +99,6 @@ def run(cmd, cwd=ROOT_DIR, label=None):
             sys.stdout.write("\r" + " " * 80 + "\r")
             sys.stdout.flush()
 
-    t = threading.Thread(target=spinner, daemon=True)
-    t.start()
-
     p = subprocess.Popen(
         cmd,
         cwd=str(cwd),
@@ -110,6 +107,9 @@ def run(cmd, cwd=ROOT_DIR, label=None):
         text=True,
         bufsize=1,
     )
+
+    t = threading.Thread(target=spinner, daemon=True)
+    t.start()
 
     rc = 1
     try:
@@ -301,8 +301,9 @@ def safe_extract_tar(tar, destination: Path):
     base_dir = destination.resolve()
     safe_members = []
     for member in tar.getmembers():
-        # Exclude links/dev nodes in fallback mode to avoid link-based escapes.
-        if member.issym() or member.islnk() or member.isdev():
+        # Fallback allowlist: only regular files and directories.
+        # This excludes links, device nodes, FIFOs, and other special entries.
+        if not (member.isreg() or member.isdir()):
             print(f"Skipping unsupported tar member type: {member.name}")
             continue
 
@@ -369,8 +370,15 @@ def select_release_tag(meta, current_tag):
         seen.add(tag)
         unique_tags.append(tag)
 
-    upgrades = [t for t in unique_tags if compare_versions(t, current_tag) > 0]
-    downgrades = [t for t in unique_tags if compare_versions(t, current_tag) < 0]
+    # If current tag is non-semver-like (e.g. "latest"), still show stable
+    # release options so users can pick a concrete version from the menu.
+    current_parsed = parse_version_tuple(current_tag)
+    if current_parsed is None:
+        upgrades = list(unique_tags)
+        downgrades = []
+    else:
+        upgrades = [t for t in unique_tags if compare_versions(t, current_tag) > 0]
+        downgrades = [t for t in unique_tags if compare_versions(t, current_tag) < 0]
 
     # Sort upgrades newest first.
     upgrades.sort(key=lambda t: parse_version_tuple(t), reverse=True)
