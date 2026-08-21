@@ -1014,11 +1014,27 @@ def _backup_tar_filter(tarinfo):
         return None
     return tarinfo
 
-def do_backup(render: bool = True):
+def _default_backup_destination():
+    """Used when do_backup() runs non-interactively (e.g. `updater --backup`)
+    with no explicit destination_override: prefer cloud+local if cloud is
+    configured and enabled, otherwise fall back to local only."""
+    return "both" if cloud_backup_ready() else "local"
+
+def do_backup(render: bool = True, interactive: bool = True, destination_override: str | None = None) -> bool:
+    """
+    Runs the full backup pipeline. Every prompt is gated behind `interactive`,
+    so this same function backs both the menu (interactive=True) and
+    `updater --backup` (interactive=False, no input() calls at all).
+    Returns True on success, False if any stage failed — used for the CLI
+    flag's exit code and (later) notification content.
+    """
     if render:
         render_screen("Backup")
     require_paths()
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    result = True
+    summary_lines = []
 
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     backup_name = f"pangolin-backup-{ts}.tar.gz"
@@ -1030,7 +1046,14 @@ def do_backup(render: bool = True):
 
     print(f"\nBackup created: {backup_path}")
 
-    destination = prompt_backup_destination()
+    if destination_override is not None:
+        destination = destination_override
+    elif interactive:
+        destination = prompt_backup_destination()
+    else:
+        destination = _default_backup_destination()
+    summary_lines.append(f"destination={destination}")
+
     if destination in ("cloud", "both"):
         cb = SETTINGS["cloud_backup"]
         key = cloud_backup_object_key(backup_name)
@@ -1038,6 +1061,7 @@ def do_backup(render: bool = True):
         try:
             s3_put_file(cb, backup_path, key)
             print("Cloud upload complete.")
+            summary_lines.append("cloud_upload=ok")
             if destination == "cloud":
                 try:
                     backup_path.unlink()
@@ -1046,17 +1070,23 @@ def do_backup(render: bool = True):
                     print(f"WARNING: Failed to remove local copy: {e}")
         except Exception as e:
             print(f"WARNING: Cloud upload failed: {e}")
+            summary_lines.append(f"cloud_upload=failed ({e})")
+            result = False
             if destination == "cloud":
                 print("Keeping local copy since the cloud upload failed.")
 
     print("\nApplying backup retention policy in /root/backup ...")
     kept, deleted = apply_backup_retention(BACKUP_DIR)
     print(f"Retention done. Kept: {len(kept)}  Deleted: {len(deleted)}")
+    summary_lines.append(f"local_retention kept={len(kept)} deleted={len(deleted)}")
 
-    cleanup_baks = input("\nCleanup all docker-compose .bak files in /root now? (Y/N) [default: N]: ").strip().lower()
-    if cleanup_baks in ("y", "yes"):
-        removed = cleanup_compose_bak_files()
-        print(f"Removed compose backups: {removed}")
+    if interactive:
+        cleanup_baks = input("\nCleanup all docker-compose .bak files in /root now? (Y/N) [default: N]: ").strip().lower()
+        if cleanup_baks in ("y", "yes"):
+            removed = cleanup_compose_bak_files()
+            print(f"Removed compose backups: {removed}")
+
+    return result
 
 def prompt_backup_destination():
     ready = cloud_backup_ready()
