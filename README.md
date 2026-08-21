@@ -81,7 +81,16 @@ Menu:
 - `[1] Backup`
 - `[2] Update`
 - `[3] Restore`
-- `[4] Close`
+- `[4] Settings`
+- `[5] Close`
+
+A "Update available" banner appears on the main menu when a newer version is published (checked at most once/day, silent on network failure).
+
+### Self-update
+```bash
+updater --update
+```
+Downloads and installs the latest version from GitHub in place. No-ops if already up to date; add `--force` to reinstall anyway.
 
 ---
 

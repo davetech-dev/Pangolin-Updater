@@ -214,6 +214,86 @@ DEFAULT_TRAEFIK_LOCK = {
     "pangolin_last_update_for_traefik_update_to_v4": "",
 }
 
+# --- Self-update: check the repo for a newer version, and install it in place ---
+UPDATER_SOURCE_URL = "https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/pangolin_updater.py"
+UPDATE_INSTALL_DEST = Path("/usr/local/bin/updater")
+UPDATE_CHECK_CACHE_FILE = Path("/etc/pangolin-updater/update_check_cache.json")
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60  # once a day
+
+def _fetch_latest_version(timeout=5):
+    req = urllib.request.Request(UPDATER_SOURCE_URL, headers={"User-Agent": f"{__app_name__}/{__version__}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read(4096).decode("utf-8", "replace")  # __version__ is near the top
+    m = re.search(r'__version__\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+    return m.group(1) if m else None
+
+def check_for_update():
+    """
+    Returns a newer version string if one is available, else None.
+    Debounced to once per UPDATE_CHECK_INTERVAL_SECONDS via a small cache
+    file; silent and non-blocking on any network failure.
+    """
+    now = time.time()
+    cache = {}
+    if UPDATE_CHECK_CACHE_FILE.exists():
+        try:
+            cache = json.loads(UPDATE_CHECK_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    latest = cache.get("latest_version")
+    if now - cache.get("last_checked", 0) >= UPDATE_CHECK_INTERVAL_SECONDS:
+        try:
+            latest = _fetch_latest_version()
+        except Exception:
+            pass  # keep whatever was cached; never block startup on network issues
+        try:
+            UPDATE_CHECK_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            UPDATE_CHECK_CACHE_FILE.write_text(json.dumps({"last_checked": now, "latest_version": latest}), encoding="utf-8")
+        except Exception:
+            pass
+
+    if latest and compare_versions(latest, __version__) > 0:
+        return latest
+    return None
+
+def do_self_update():
+    require_root()
+    force = "--force" in sys.argv
+    print(f"Current version: {__version__}")
+    print("Fetching latest version from GitHub...")
+    try:
+        req = urllib.request.Request(UPDATER_SOURCE_URL, headers={"User-Agent": f"{__app_name__}/{__version__}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            new_source = resp.read()
+    except Exception as e:
+        print(f"ERROR: Failed to download latest version: {e}")
+        sys.exit(1)
+
+    text = new_source.decode("utf-8", "replace")
+    first_line = text.splitlines()[0] if text else ""
+    if not first_line.startswith("#!") or "python3" not in first_line:
+        print("ERROR: Downloaded script does not start with a python3 shebang. Aborting.")
+        sys.exit(1)
+
+    m = re.search(r'__version__\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+    if not m:
+        print("ERROR: Could not determine the downloaded version. Aborting.")
+        sys.exit(1)
+    latest_version = m.group(1)
+    print(f"Latest version:  {latest_version}")
+
+    if not force and compare_versions(latest_version, __version__) <= 0:
+        print("Already up to date. Use 'updater --update --force' to reinstall anyway.")
+        sys.exit(0)
+
+    tmp_path = UPDATE_INSTALL_DEST.with_suffix(".new")
+    tmp_path.write_bytes(new_source)
+    tmp_path.chmod(0o755)
+    tmp_path.replace(UPDATE_INSTALL_DEST)  # atomic on the same filesystem
+    print(f"Updated: {UPDATE_INSTALL_DEST}")
+    print(f"Installed version now: {latest_version}")
+
 def handle_cli_flags():
     if len(sys.argv) <= 1:
         return
@@ -226,8 +306,14 @@ def handle_cli_flags():
         print(f"""Usage:
   updater              Run interactive menu
   updater --version    Show version
+  updater --update      Install the latest version from GitHub
+  updater --update --force  Reinstall even if already up to date
   updater --help       Show help
 """)
+        sys.exit(0)
+
+    if sys.argv[1] == "--update":
+        do_self_update()
         sys.exit(0)
 
 _stdout_lock = threading.Lock()
@@ -1664,8 +1750,13 @@ def main():
     handle_cli_flags()
     require_root()
 
+    newer_version = check_for_update()
+
     while True:
         render_screen("Main Menu")
+        if newer_version:
+            print(ui_text(f"Update available: v{__version__} -> v{newer_version}  (run: updater --update)", color=ANSI_CYAN, bold=True))
+            print()
         print("[1] Backup stack and config")
         print("[2] Update image versions")
         print("[3] Restore from backup")
