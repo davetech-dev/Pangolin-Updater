@@ -8,12 +8,18 @@ import subprocess
 import threading
 import time
 import json
+import getpass
+import hashlib
+import hmac
+import http.client
+import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 __app_name__ = "pangolin-updater"
 __version__ = "0.1.2"
@@ -94,7 +100,15 @@ DEFAULT_SETTINGS = {
     "backup_path": "",  # empty = derive from root_dir/backup
     "cloud_backup": {
         "enabled": False,
-        "provider": "",
+        "provider": "s3",  # S3-compatible object storage (MinIO, AWS S3, etc.)
+        "endpoint": "",
+        "bucket": "",
+        "access_key": "",
+        "secret_key": "",
+        "region": "us-east-1",
+        "prefix": "",
+        "use_path_style": True,
+        "verify_ssl": True,
     },
 }
 
@@ -141,6 +155,8 @@ def load_settings():
 def save_settings(settings):
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    # Settings may contain cloud storage secret keys; keep the file root-only.
+    SETTINGS_FILE.chmod(0o600)
 
 SETTINGS = load_settings()
 
@@ -453,6 +469,268 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
         tags.append(tag)
     return tags
 
+
+# --- Cloud Backup: S3-compatible object storage (MinIO, AWS S3, etc.) ---
+#
+# Implemented directly against the AWS Signature Version 4 protocol using
+# only the standard library, so this tool stays a single dependency-free
+# script. Any S3-compatible endpoint (self-hosted MinIO, AWS S3, Backblaze
+# B2, Wasabi, DigitalOcean Spaces, ...) works as long as it speaks SigV4.
+
+def cloud_backup_configured():
+    cb = SETTINGS["cloud_backup"]
+    return bool(cb.get("endpoint") and cb.get("bucket") and cb.get("access_key") and cb.get("secret_key"))
+
+def cloud_backup_ready():
+    return bool(SETTINGS["cloud_backup"].get("enabled")) and cloud_backup_configured()
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def _s3_endpoint_scheme_host(cfg):
+    endpoint = (cfg.get("endpoint") or "").strip().rstrip("/")
+    if "://" not in endpoint:
+        endpoint = "https://" + endpoint
+    parsed = urllib.parse.urlparse(endpoint)
+    return parsed.scheme or "https", parsed.netloc
+
+def _s3_object_target(cfg, key):
+    """Returns (scheme, request_host, canonical_uri) for a given object key."""
+    scheme, host = _s3_endpoint_scheme_host(cfg)
+    bucket = cfg["bucket"]
+    safe_key = "/".join(urllib.parse.quote(seg, safe="") for seg in key.split("/"))
+    if cfg.get("use_path_style", True):
+        return scheme, host, f"/{bucket}/{safe_key}"
+    return scheme, f"{bucket}.{host}", f"/{safe_key}"
+
+def _s3_bucket_target(cfg):
+    """Returns (scheme, request_host, canonical_uri) for bucket-level operations (e.g. ListObjects)."""
+    scheme, host = _s3_endpoint_scheme_host(cfg)
+    bucket = cfg["bucket"]
+    if cfg.get("use_path_style", True):
+        return scheme, host, f"/{bucket}"
+    return scheme, f"{bucket}.{host}", "/"
+
+def _s3_canonical_query(params):
+    items = sorted(params.items())
+    return "&".join(
+        f"{urllib.parse.quote(str(k), safe='')}={urllib.parse.quote(str(v), safe='')}"
+        for k, v in items
+    )
+
+def _s3_connect(cfg, scheme, host, timeout):
+    hostname, _, port_s = host.partition(":")
+    port = int(port_s) if port_s else None
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        if not cfg.get("verify_ssl", True):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return http.client.HTTPSConnection(hostname, port=port, timeout=timeout, context=ctx)
+    return http.client.HTTPConnection(hostname, port=port, timeout=timeout)
+
+def _s3_sign(cfg, method, host, canonical_uri, headers, payload_hash, canonical_querystring=""):
+    """
+    Builds the Authorization header value per AWS Signature Version 4.
+    `headers` must already include every header that will be sent and be
+    signed (lowercase keys); host/x-amz-date/x-amz-content-sha256 are
+    expected to already be present.
+    """
+    access_key = cfg["access_key"]
+    secret_key = cfg["secret_key"]
+    region = cfg.get("region") or "us-east-1"
+    amzdate = headers["x-amz-date"]
+    datestamp = amzdate[:8]
+
+    signed_header_names = sorted(headers.keys())
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in signed_header_names)
+    signed_headers = ";".join(signed_header_names)
+
+    canonical_request = "\n".join([
+        method, canonical_uri, canonical_querystring, canonical_headers, signed_headers, payload_hash,
+    ])
+    credential_scope = f"{datestamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256",
+        amzdate,
+        credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+
+    def _hmac(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode("utf-8"), datestamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, "s3")
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    return (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+def _s3_amzdate():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+def s3_put_bytes(cfg, key, data: bytes, content_type="application/octet-stream", timeout=30):
+    scheme, host, canonical_uri = _s3_object_target(cfg, key)
+    payload_hash = hashlib.sha256(data).hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-date": _s3_amzdate(),
+        "x-amz-content-sha256": payload_hash,
+        "content-type": content_type,
+        "content-length": str(len(data)),
+    }
+    headers["authorization"] = _s3_sign(cfg, "PUT", host, canonical_uri, headers, payload_hash)
+
+    conn = _s3_connect(cfg, scheme, host, timeout)
+    try:
+        conn.request("PUT", canonical_uri, body=data, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"S3 PUT failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
+    finally:
+        conn.close()
+
+def s3_delete(cfg, key, timeout=30):
+    scheme, host, canonical_uri = _s3_object_target(cfg, key)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-date": _s3_amzdate(),
+        "x-amz-content-sha256": payload_hash,
+    }
+    headers["authorization"] = _s3_sign(cfg, "DELETE", host, canonical_uri, headers, payload_hash)
+
+    conn = _s3_connect(cfg, scheme, host, timeout)
+    try:
+        conn.request("DELETE", canonical_uri, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        if resp.status not in (200, 202, 204):
+            raise RuntimeError(f"S3 DELETE failed ({resp.status})")
+    finally:
+        conn.close()
+
+def s3_put_file(cfg, local_path: Path, key, content_type="application/gzip", timeout=600):
+    """Streams local_path to the object store; never loads the whole file into memory."""
+    scheme, host, canonical_uri = _s3_object_target(cfg, key)
+    payload_hash = _sha256_file(local_path)
+    size = local_path.stat().st_size
+    headers = {
+        "host": host,
+        "x-amz-date": _s3_amzdate(),
+        "x-amz-content-sha256": payload_hash,
+        "content-type": content_type,
+        "content-length": str(size),
+    }
+    headers["authorization"] = _s3_sign(cfg, "PUT", host, canonical_uri, headers, payload_hash)
+
+    conn = _s3_connect(cfg, scheme, host, timeout)
+    try:
+        conn.putrequest("PUT", canonical_uri, skip_host=True, skip_accept_encoding=True)
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        with open(local_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"S3 upload failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
+    finally:
+        conn.close()
+
+def s3_test_connection(cfg):
+    """Uploads then deletes a tiny marker object to confirm credentials/bucket access."""
+    prefix = (cfg.get("prefix") or "").strip("/")
+    marker_key = f"{prefix}/.pangolin-updater-connectivity-test".lstrip("/")
+    s3_put_bytes(cfg, marker_key, b"pangolin-updater connectivity test\n", content_type="text/plain")
+    s3_delete(cfg, marker_key)
+
+def cloud_backup_object_key(backup_name):
+    prefix = (SETTINGS["cloud_backup"].get("prefix") or "").strip("/")
+    return f"{prefix}/{backup_name}".lstrip("/")
+
+def s3_list_objects(cfg, prefix="", timeout=30):
+    """Returns a list of {key, size, last_modified} dicts via ListObjectsV2."""
+    scheme, host, canonical_uri = _s3_bucket_target(cfg)
+    params = {"list-type": "2"}
+    if prefix:
+        params["prefix"] = prefix
+    query = _s3_canonical_query(params)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-date": _s3_amzdate(),
+        "x-amz-content-sha256": payload_hash,
+    }
+    headers["authorization"] = _s3_sign(cfg, "GET", host, canonical_uri, headers, payload_hash, canonical_querystring=query)
+
+    conn = _s3_connect(cfg, scheme, host, timeout)
+    try:
+        conn.request("GET", f"{canonical_uri}?{query}", headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status != 200:
+            raise RuntimeError(f"S3 LIST failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
+    finally:
+        conn.close()
+
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(body)
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    contents = root.findall("s3:Contents", ns) or root.findall("Contents")
+    objects = []
+    for c in contents:
+        key = c.findtext("s3:Key", default=None, namespaces=ns) or c.findtext("Key", default="")
+        size_text = c.findtext("s3:Size", default=None, namespaces=ns) or c.findtext("Size", default="0")
+        last_modified = c.findtext("s3:LastModified", default=None, namespaces=ns) or c.findtext("LastModified", default="")
+        objects.append({"key": key, "size": int(size_text), "last_modified": last_modified})
+    return objects
+
+def s3_get_object_to_file(cfg, key, dest_path: Path, timeout=600):
+    """Streams an object to a local file; never loads the whole response into memory."""
+    scheme, host, canonical_uri = _s3_object_target(cfg, key)
+    payload_hash = hashlib.sha256(b"").hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-date": _s3_amzdate(),
+        "x-amz-content-sha256": payload_hash,
+    }
+    headers["authorization"] = _s3_sign(cfg, "GET", host, canonical_uri, headers, payload_hash)
+
+    conn = _s3_connect(cfg, scheme, host, timeout)
+    try:
+        conn.request("GET", canonical_uri, headers=headers)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            body = resp.read()
+            raise RuntimeError(f"S3 GET failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+    finally:
+        conn.close()
+
 def safe_extract_tar(tar, destination: Path):
     """
     Extract tar safely.
@@ -661,6 +939,26 @@ def do_backup(render: bool = True):
         tar.add(str(CONFIG_DIR), arcname="config", filter=_backup_tar_filter)
 
     print(f"\nBackup created: {backup_path}")
+
+    destination = prompt_backup_destination()
+    if destination in ("cloud", "both"):
+        cb = SETTINGS["cloud_backup"]
+        key = cloud_backup_object_key(backup_name)
+        print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
+        try:
+            s3_put_file(cb, backup_path, key)
+            print("Cloud upload complete.")
+            if destination == "cloud":
+                try:
+                    backup_path.unlink()
+                    print("Local copy removed (Cloud only).")
+                except Exception as e:
+                    print(f"WARNING: Failed to remove local copy: {e}")
+        except Exception as e:
+            print(f"WARNING: Cloud upload failed: {e}")
+            if destination == "cloud":
+                print("Keeping local copy since the cloud upload failed.")
+
     print("\nApplying backup retention policy in /root/backup ...")
     kept, deleted = apply_backup_retention(BACKUP_DIR)
     print(f"Retention done. Kept: {len(kept)}  Deleted: {len(deleted)}")
@@ -669,6 +967,28 @@ def do_backup(render: bool = True):
     if cleanup_baks in ("y", "yes"):
         removed = cleanup_compose_bak_files()
         print(f"Removed compose backups: {removed}")
+
+def prompt_backup_destination():
+    ready = cloud_backup_ready()
+    print("\nWhere do you want to store this backup?")
+    print("  [1] Local only (default)")
+    if ready:
+        print("  [2] Cloud only")
+        print("  [3] Both Local and Cloud")
+    else:
+        print("  [2] Cloud only            (not available — set up Cloud Backup in Settings first)")
+        print("  [3] Both Local and Cloud  (not available — set up Cloud Backup in Settings first)")
+    val = input("Choose [default: 1]: ").strip()
+    if val in ("2", "3") and not ready:
+        print("Cloud Backup isn't configured yet. Go to Settings > Cloud Backup to set it up. Defaulting to Local only.")
+        return "local"
+    if val == "2":
+        return "cloud"
+    if val == "3":
+        return "both"
+    if val not in ("", "1"):
+        print("Invalid choice. Defaulting to Local only.")
+    return "local"
 
 def cleanup_compose_bak_files() -> int:
     pattern = "docker-compose.yml.bak.*"
@@ -895,27 +1215,96 @@ def do_update():
         else:
             print("Unused images removed.")
 
+def prompt_restore_source():
+    ready = cloud_backup_ready()
+    print("\nRestore from:")
+    print("  [1] Local (default)")
+    if ready:
+        print("  [2] Cloud")
+    else:
+        print("  [2] Cloud   (not available — set up Cloud Backup in Settings first)")
+    val = input("Choose [default: 1]: ").strip()
+    if val == "2" and not ready:
+        print("Cloud Backup isn't configured yet. Go to Settings > Cloud Backup to set it up. Defaulting to Local.")
+        return "local"
+    if val == "2":
+        return "cloud"
+    return "local"
+
 def do_restore():
     render_screen("Restore")
-    backups = list_backups(BACKUP_DIR)
-    if not backups:
-        print(f"\nNo backups found in {BACKUP_DIR}.")
-        return
+    source = prompt_restore_source()
 
-    print("\nAvailable backups (oldest -> newest):")
-    for i, b in enumerate(backups, start=1):
-        print(f"  [{i}] {b.path.name}")
+    downloaded_tmp = None
+    if source == "cloud":
+        cb = SETTINGS["cloud_backup"]
+        prefix = (cb.get("prefix") or "").strip("/")
+        print("\nFetching backup list from cloud storage...")
+        try:
+            objects = s3_list_objects(cb, prefix=prefix)
+        except Exception as e:
+            print(f"Failed to list cloud backups: {e}")
+            return
 
-    choice = input("\nEnter the number of the backup to restore (or blank to cancel): ").strip()
-    if choice == "":
-        print("Cancelled.")
-        return
+        candidates = []
+        for obj in objects:
+            name = obj["key"].rsplit("/", 1)[-1]
+            if BACKUP_RE.match(name):
+                candidates.append((obj, name))
+        if not candidates:
+            print(f"\nNo backups found in cloud storage (bucket: {cb['bucket']}, prefix: {prefix or '(root)'}).")
+            return
+        candidates.sort(key=lambda c: c[1])  # filename timestamp sorts chronologically
 
-    if not choice.isdigit() or not (1 <= int(choice) <= len(backups)):
-        print("Invalid selection.")
-        return
+        print("\nAvailable cloud backups (oldest -> newest):")
+        for i, (obj, name) in enumerate(candidates, start=1):
+            size_mb = obj["size"] / (1024 * 1024)
+            print(f"  [{i}] {name}  ({size_mb:.1f} MB)")
 
-    selected = backups[int(choice) - 1]
+        choice = input("\nEnter the number of the backup to restore (or blank to cancel): ").strip()
+        if choice == "":
+            print("Cancelled.")
+            return
+        if not choice.isdigit() or not (1 <= int(choice) <= len(candidates)):
+            print("Invalid selection.")
+            return
+
+        obj, name = candidates[int(choice) - 1]
+        cloud_download_dir = BACKUP_DIR / ".cloud_downloads"
+        cloud_download_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_tmp = cloud_download_dir / name
+        print(f"\nDownloading {name} from cloud storage...")
+        try:
+            s3_get_object_to_file(cb, obj["key"], downloaded_tmp)
+        except Exception as e:
+            print(f"Failed to download backup: {e}")
+            if downloaded_tmp.exists():
+                downloaded_tmp.unlink()
+            return
+        print("Download complete.")
+        m = BACKUP_RE.match(name)
+        selected = BackupFile(path=downloaded_tmp, dt=datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S"))
+    else:
+        backups = list_backups(BACKUP_DIR)
+        if not backups:
+            print(f"\nNo backups found in {BACKUP_DIR}.")
+            return
+
+        print("\nAvailable backups (oldest -> newest):")
+        for i, b in enumerate(backups, start=1):
+            print(f"  [{i}] {b.path.name}")
+
+        choice = input("\nEnter the number of the backup to restore (or blank to cancel): ").strip()
+        if choice == "":
+            print("Cancelled.")
+            return
+
+        if not choice.isdigit() or not (1 <= int(choice) <= len(backups)):
+            print("Invalid selection.")
+            return
+
+        selected = backups[int(choice) - 1]
+
     print(f"\nSelected: {selected.path.name}")
     print("WARNING: This will overwrite /root/docker-compose.yml and completely replace /root/config/.")
     confirm = input("Type YES to confirm (there is no going back): ").strip()
@@ -1018,6 +1407,15 @@ def do_restore():
                 shutil.rmtree(tmp_dir)
             except Exception as e:
                 print(f"\nWARNING: Failed to remove temporary restore directory {tmp_dir}: {e}")
+        if downloaded_tmp is not None and downloaded_tmp.exists():
+            try:
+                downloaded_tmp.unlink()
+                try:
+                    downloaded_tmp.parent.rmdir()  # remove .cloud_downloads/ if now empty
+                except OSError:
+                    pass
+            except Exception as e:
+                print(f"\nWARNING: Failed to remove downloaded cloud backup file {downloaded_tmp}: {e}")
 
     if not stack_stopped:
         return
@@ -1106,11 +1504,45 @@ def settings_backup_path():
     refresh_paths()
     print(f"Backup path set to: {BACKUP_DIR}")
 
-def settings_cloud_backup():
+def _mask_secret_display(val, shown_prefix_len=4):
+    if not val:
+        return "not set"
+    if len(val) <= shown_prefix_len:
+        return "set"
+    return val[:shown_prefix_len] + "…"
+
+def settings_cloud_field(field, label, secret=False):
     cb = SETTINGS["cloud_backup"]
-    print(f"\nCloud Backup is currently: {'Enabled' if cb.get('enabled') else 'Disabled'}")
-    print("(Provider integration not yet implemented — this only stores your preference.)")
-    val = input("Enable cloud backup? (Y/N) [blank to keep current]: ").strip().lower()
+    if secret:
+        val = getpass.getpass(f"\nEnter {label} [blank to keep current]: ")
+    else:
+        current = cb.get(field) or "not set"
+        val = input(f"\nEnter {label} [blank to keep '{current}']: ").strip()
+    if val == "":
+        return
+    cb[field] = val
+    save_settings(SETTINGS)
+    print(f"{label} updated.")
+
+def settings_cloud_toggle_field(field, label, default=True):
+    cb = SETTINGS["cloud_backup"]
+    current = cb.get(field, default)
+    val = input(f"\n{label}? (Y/N) [current: {'Y' if current else 'N'}]: ").strip().lower()
+    if val in ("y", "yes"):
+        cb[field] = True
+    elif val in ("n", "no"):
+        cb[field] = False
+    else:
+        return
+    save_settings(SETTINGS)
+    print(f"{label}: {'Yes' if cb[field] else 'No'}")
+
+def settings_cloud_backup_toggle():
+    cb = SETTINGS["cloud_backup"]
+    if not cb.get("enabled") and not cloud_backup_configured():
+        print("\nCloud Backup can't be enabled yet — set Endpoint, Bucket, Access Key, and Secret Key first.")
+        return
+    val = input(f"\nEnable Cloud Backup? (Y/N) [current: {'Y' if cb.get('enabled') else 'N'}]: ").strip().lower()
     if val in ("y", "yes"):
         cb["enabled"] = True
     elif val in ("n", "no"):
@@ -1118,7 +1550,63 @@ def settings_cloud_backup():
     else:
         return
     save_settings(SETTINGS)
-    print(f"Cloud Backup set to: {'Enabled' if cb['enabled'] else 'Disabled'}")
+    print(f"Cloud Backup: {'Enabled' if cb['enabled'] else 'Disabled'}")
+
+def settings_cloud_test_connection():
+    cb = SETTINGS["cloud_backup"]
+    if not cloud_backup_configured():
+        print("\nSet Endpoint, Bucket, Access Key, and Secret Key first.")
+        return
+    print("\nTesting connection (uploading + deleting a small marker object)...")
+    try:
+        s3_test_connection(cb)
+        print("Success: credentials and bucket access look good.")
+    except Exception as e:
+        print(f"Failed: {e}")
+
+def do_settings_cloud_backup():
+    while True:
+        render_screen("Settings > Cloud Backup")
+        cb = SETTINGS["cloud_backup"]
+        print(f"[1]  Enable/Disable          (current: {'Enabled' if cb.get('enabled') else 'Disabled'})")
+        print(f"[2]  Endpoint URL            (current: {cb.get('endpoint') or 'not set'})")
+        print(f"[3]  Bucket                  (current: {cb.get('bucket') or 'not set'})")
+        print(f"[4]  Access Key              (current: {_mask_secret_display(cb.get('access_key'))})")
+        print(f"[5]  Secret Key              (current: {'set' if cb.get('secret_key') else 'not set'})")
+        print(f"[6]  Region                  (current: {cb.get('region') or 'us-east-1'})")
+        print(f"[7]  Path Prefix             (current: {cb.get('prefix') or '(bucket root)'})")
+        print(f"[8]  Path-style addressing   (current: {'Yes' if cb.get('use_path_style', True) else 'No'})")
+        print(f"[9]  Verify SSL certificate  (current: {'Yes' if cb.get('verify_ssl', True) else 'No'})")
+        print("[10] Test Connection")
+        print("[11] Back to Settings")
+        if not cloud_backup_configured():
+            print("\nNote: Endpoint, Bucket, Access Key, and Secret Key are all required before enabling.")
+        choice = input("Select an option [1-11]: ").strip()
+
+        if choice == "1":
+            settings_cloud_backup_toggle()
+        elif choice == "2":
+            settings_cloud_field("endpoint", "Endpoint URL (e.g. https://minio.example.com:9000)")
+        elif choice == "3":
+            settings_cloud_field("bucket", "Bucket name")
+        elif choice == "4":
+            settings_cloud_field("access_key", "Access Key")
+        elif choice == "5":
+            settings_cloud_field("secret_key", "Secret Key", secret=True)
+        elif choice == "6":
+            settings_cloud_field("region", "Region (MinIO default: us-east-1)")
+        elif choice == "7":
+            settings_cloud_field("prefix", "Path prefix (e.g. pangolin/, blank for bucket root)")
+        elif choice == "8":
+            settings_cloud_toggle_field("use_path_style", "Use path-style addressing (required by most MinIO setups)")
+        elif choice == "9":
+            settings_cloud_toggle_field("verify_ssl", "Verify SSL certificate (disable only for self-signed MinIO)")
+        elif choice == "10":
+            settings_cloud_test_connection()
+        elif choice == "11":
+            return
+        else:
+            print("Invalid option.")
 
 def do_settings():
     while True:
@@ -1126,7 +1614,13 @@ def do_settings():
         backup_display = str(BACKUP_DIR)
         if not SETTINGS.get("backup_path"):
             backup_display += "  (default)"
-        cb_display = "Enabled" if SETTINGS["cloud_backup"].get("enabled") else "Disabled"
+        cb = SETTINGS["cloud_backup"]
+        if cb.get("enabled"):
+            cb_display = "Enabled"
+        elif cloud_backup_configured():
+            cb_display = "Configured (disabled)"
+        else:
+            cb_display = "Not configured"
         print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition'] or 'Auto-detect'})")
         print(f"[2] Pangolin Root Directory   (current: {ROOT_DIR})")
         print(f"[3] Backup Path               (current: {backup_display})")
@@ -1141,7 +1635,7 @@ def do_settings():
         elif choice == "3":
             settings_backup_path()
         elif choice == "4":
-            settings_cloud_backup()
+            do_settings_cloud_backup()
         elif choice == "5":
             return
         else:
