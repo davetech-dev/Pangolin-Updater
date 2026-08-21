@@ -330,6 +330,8 @@ def handle_cli_flags():
   updater --backup --destination=local|cloud|both  Override the backup destination
   updater --verify-backup  Verify the latest backup is restorable, without touching the live stack
   updater --verify-backup --source=local|cloud  Override which backup to verify
+  updater --check-updates  Report available image updates; never applies them
+  updater --status      Show a read-only diagnostic snapshot
   updater --help       Show help
 """)
         sys.exit(0)
@@ -361,6 +363,40 @@ def handle_cli_flags():
             sys.exit(2)
         ok = do_verify_backup(source_override=source_override)
         sys.exit(0 if ok else 1)
+
+    if sys.argv[1] == "--check-updates":
+        # Read-only: reports what's available, never applies anything.
+        require_root()
+        results = check_for_image_updates()
+        errors = [r for r in results if r["error"]]
+        updates = [r for r in results if r["has_update"]]
+
+        for r in results:
+            if r["error"]:
+                print(f"- {r['display']}: could not check ({r['error']})")
+            elif r["has_update"]:
+                print(f"- {r['display']}: {r['current']} -> {r['latest']} (update available)")
+            else:
+                print(f"- {r['display']}: {r['current']} (up to date)")
+
+        if errors:
+            summary = f"host={socket.gethostname()} failed to check: " + "; ".join(f"{r['display']} ({r['error']})" for r in errors)
+            send_notification(False, summary, event_label="Update Check")
+            sys.exit(2)
+
+        if updates:
+            summary = f"host={socket.gethostname()} updates available: " + "; ".join(f"{r['display']} {r['current']} -> {r['latest']}" for r in updates)
+            send_notification(True, summary, event_label="Update Check")
+            print("\nUpdates are available. This command never applies them — run 'updater' to review and apply interactively.")
+            sys.exit(1)
+
+        print("\nAll images are up to date.")
+        sys.exit(0)
+
+    if sys.argv[1] == "--status":
+        require_root()
+        do_status()
+        sys.exit(0)
 
     print(f"Unrecognized argument: {sys.argv[1]}")
     print("Run 'updater --help' to see available commands.")
@@ -1067,83 +1103,65 @@ def safe_extract_tar(tar, destination: Path):
     for member in safe_members:
         tar.extract(member, path=base_dir)
 
-def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from_tag=None, pangolin_edition_setting=None):
-    display = meta["display"]
-    github_repo = meta.get("github_repo")
-    release_url = meta.get("release_url")
-    upgrade_note = meta.get("upgrade_note")
+def _get_release_candidates(meta, current_tag, major_version_lock=None, pangolin_edition_setting=None):
+    """
+    Fetches and classifies release tags for `meta`'s image against
+    current_tag, applying the same rules the interactive picker renders as
+    a menu: RC/beta/etc-filtered stable tags only (fetch_github_release_tags),
+    the Traefik major-version lock, and Pangolin edition-aware tag
+    prefixing/comparison. Pure — no printing, no input(). Shared by
+    select_release_tag() (interactive) and check_for_image_updates()
+    (--check-updates, non-interactive).
 
-    # Edition-aware handling (Pangolin only): GitHub release tags are always
-    # bare (e.g. "1.21.1"), but Docker Hub prefixes Enterprise Edition images
-    # with "ee-". pangolin_edition_setting is None for gerbil/traefik.
+    Returns a dict:
+      ok: bool — False if current_tag is None, github_repo isn't configured,
+          or the fetch failed (see 'error' for why)
+      error: str | None
+      upgrades: list[str] — bare tags, newest first
+      one_downgrade: str | None — nearest lower bare tag
+      full_tag: callable(bare) -> str — applies the edition prefix if any
+      compare_basis: str | None — bare current tag used for comparison
+      use_edition_logic, edition_prefix, detected_edition, target_edition,
+      edition_warning: edition-awareness details (Pangolin only; None/False
+          for gerbil/traefik)
+    """
+    github_repo = meta.get("github_repo")
+
     use_edition_logic = False
     edition_prefix = ""
     compare_basis = current_tag
-    if pangolin_edition_setting is not None:
+    detected_edition = None
+    target_edition = None
+    edition_warning = None
+    if pangolin_edition_setting is not None and current_tag is not None:
         detected_edition, bare_current = detect_pangolin_tag(current_tag)
         if detected_edition is None:
-            print(f"  Warning: current tag '{current_tag}' uses a variant (e.g. Postgres) this tool doesn't manage edition-wise yet; select/enter tags manually.")
+            edition_warning = f"current tag '{current_tag}' uses a variant (e.g. Postgres) this tool doesn't manage edition-wise yet"
         else:
             target_edition = pangolin_edition_setting if pangolin_edition_setting in PANGOLIN_EDITION_PREFIXES else detected_edition
             edition_prefix = PANGOLIN_EDITION_PREFIXES[target_edition]
             compare_basis = bare_current
             use_edition_logic = True
-            if target_edition != detected_edition:
-                print(f"  NOTE: Settings > Pangolin Edition is '{target_edition}', but the running image is '{detected_edition}'. Picking an update below will switch editions ({detected_edition} -> {target_edition}).")
 
     def full_tag(bare):
         return f"{edition_prefix}{bare}" if use_edition_logic else bare
 
-    def annotation_for(tag):
-        if not annotate_from_tag:
-            return ""
-        threshold = parse_version_tuple(annotate_from_tag)
-        tt = parse_version_tuple(tag)
-        if threshold is None or tt is None:
-            return ""
-        max_len = max(len(threshold), len(tt))
-        t_pad = threshold + (0,) * (max_len - len(threshold))
-        v_pad = tt + (0,) * (max_len - len(tt))
-        if v_pad >= t_pad:
-            return "  [!] Requires updating Traefik to v4"
-        return ""
+    result = {
+        "upgrades": [], "one_downgrade": None, "full_tag": full_tag,
+        "compare_basis": compare_basis, "use_edition_logic": use_edition_logic,
+        "edition_prefix": edition_prefix, "detected_edition": detected_edition,
+        "target_edition": target_edition, "edition_warning": edition_warning,
+    }
 
     if current_tag is None:
-        val = input(f"Enter {display} version tag to pin (current not detected) [leave blank to keep]: ").strip()
-        return val if val else current_tag
-
-    print(f"\n{display} versions:")
-    if release_url:
-        print(f"  Releases: {release_url}")
-    if upgrade_note:
-        print(f"  NOTE: {upgrade_note}")
-    if major_version_lock:
-        print(f"  NOTE: Locked to {major_version_lock}.x per Pangolin maintainer guidance. Only that major version is offered below.")
-
+        return {**result, "ok": False, "error": "current tag not detected"}
     if not github_repo:
-        print("  Release source not configured.")
-        print(f"  [0] {style_current_tag(current_tag)} (Current)")
-        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val in ("", "0"):
-            return current_tag
-        return val
+        return {**result, "ok": False, "error": "release source not configured"}
 
     try:
         release_tags = fetch_github_release_tags(github_repo)
-    except urllib.error.URLError as e:
-        print(f"  Failed to fetch releases: {e}")
-        print(f"  [0] {style_current_tag(current_tag)} (Current)")
-        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val in ("", "0"):
-            return current_tag
-        return val
     except Exception as e:
-        print(f"  Failed to parse releases: {e}")
-        print(f"  [0] {style_current_tag(current_tag)} (Current)")
-        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
-        if val in ("", "0"):
-            return current_tag
-        return val
+        return {**result, "ok": False, "error": f"failed to fetch releases: {e}"}
 
     # Keep unique semver-like tags only.
     unique_tags = []
@@ -1181,6 +1199,60 @@ def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from
     one_downgrade = None
     if downgrades:
         one_downgrade = max(downgrades, key=lambda t: parse_version_tuple(t))
+
+    return {**result, "ok": True, "error": None, "upgrades": upgrades, "one_downgrade": one_downgrade}
+
+def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from_tag=None, pangolin_edition_setting=None):
+    display = meta["display"]
+    release_url = meta.get("release_url")
+    upgrade_note = meta.get("upgrade_note")
+
+    def annotation_for(tag):
+        if not annotate_from_tag:
+            return ""
+        threshold = parse_version_tuple(annotate_from_tag)
+        tt = parse_version_tuple(tag)
+        if threshold is None or tt is None:
+            return ""
+        max_len = max(len(threshold), len(tt))
+        t_pad = threshold + (0,) * (max_len - len(threshold))
+        v_pad = tt + (0,) * (max_len - len(tt))
+        if v_pad >= t_pad:
+            return "  [!] Requires updating Traefik to v4"
+        return ""
+
+    if current_tag is None:
+        val = input(f"Enter {display} version tag to pin (current not detected) [leave blank to keep]: ").strip()
+        return val if val else current_tag
+
+    print(f"\n{display} versions:")
+    if release_url:
+        print(f"  Releases: {release_url}")
+    if upgrade_note:
+        print(f"  NOTE: {upgrade_note}")
+    if major_version_lock:
+        print(f"  NOTE: Locked to {major_version_lock}.x per Pangolin maintainer guidance. Only that major version is offered below.")
+
+    candidates = _get_release_candidates(meta, current_tag, major_version_lock=major_version_lock, pangolin_edition_setting=pangolin_edition_setting)
+
+    if candidates["edition_warning"]:
+        print(f"  Warning: {candidates['edition_warning']}; select/enter tags manually.")
+    if candidates["use_edition_logic"] and candidates["target_edition"] != candidates["detected_edition"]:
+        print(f"  NOTE: Settings > Pangolin Edition is '{candidates['target_edition']}', but the running image is '{candidates['detected_edition']}'. Picking an update below will switch editions ({candidates['detected_edition']} -> {candidates['target_edition']}).")
+
+    if not candidates["ok"]:
+        err = candidates["error"] or "unknown error"
+        print(f"  {err[0].upper()}{err[1:]}.")
+        print(f"  [0] {style_current_tag(current_tag)} (Current)")
+        val = input(f"Choose number [default: 0], or type tag manually: ").strip()
+        if val in ("", "0"):
+            return current_tag
+        return val
+
+    full_tag = candidates["full_tag"]
+    upgrades = candidates["upgrades"]
+    one_downgrade = candidates["one_downgrade"]
+    compare_basis = candidates["compare_basis"]
 
     option_map = {}
     idx = 1
@@ -1581,6 +1653,40 @@ def apply_cloud_backup_retention(cfg: dict, prefix: str = "", now: datetime | No
                 print(f"Warning: failed to delete cloud backup {key}: {e}")
 
     return (kept, deleted)
+
+
+def check_for_image_updates():
+    """
+    Non-interactive: for each managed image, reports whether a stable
+    upgrade is available, using the exact same rules the interactive
+    picker uses (Traefik major-version lock, Pangolin edition awareness,
+    RC/beta/etc filtering) via the shared _get_release_candidates().
+    Never applies anything — this only checks. Returns a list of dicts:
+      {key, display, current, latest, has_update, error}
+    """
+    require_paths()
+    compose_text = read_compose_text()
+    current = parse_current_tags(compose_text)
+    traefik_lock = fetch_traefik_lock()
+
+    results = []
+    for key, meta in IMAGES.items():
+        old = current.get(key)
+        major_version_lock = traefik_lock["current_traefik_version_tag"] if key == "traefik" else None
+        pangolin_edition_setting = SETTINGS["pangolin_edition"] if key == "pangolin" else None
+        candidates = _get_release_candidates(
+            meta, old,
+            major_version_lock=major_version_lock,
+            pangolin_edition_setting=pangolin_edition_setting,
+        )
+        if not candidates["ok"]:
+            results.append({"key": key, "display": meta["display"], "current": old, "latest": None, "has_update": False, "error": candidates["error"]})
+            continue
+        full_tag = candidates["full_tag"]
+        upgrades = candidates["upgrades"]
+        latest = full_tag(upgrades[0]) if upgrades else old
+        results.append({"key": key, "display": meta["display"], "current": old, "latest": latest, "has_update": bool(upgrades), "error": None})
+    return results
 
 
 def do_update():
@@ -2044,6 +2150,82 @@ def do_verify_backup(source_override: str | None = None) -> bool:
     send_notification(ok, summary, event_label="Verify")
     return ok
 
+
+def _format_age(delta: timedelta) -> str:
+    total_seconds = max(int(delta.total_seconds()), 0)
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+def do_status():
+    """
+    Read-only diagnostic snapshot: running image versions, edition,
+    local/cloud backup freshness, and each optional feature's
+    configured/ready state. Never modifies anything.
+    """
+    require_paths()
+    print(f"{__app_name__} v{__version__}")
+    print(f"Root directory: {ROOT_DIR}")
+
+    compose_text = read_compose_text()
+    current = parse_current_tags(compose_text)
+    print("\nRunning image tags:")
+    for key, meta in IMAGES.items():
+        print(f"  {meta['display']}: {current.get(key) or '(not detected)'}")
+
+    print(f"\nPangolin Edition setting: {SETTINGS['pangolin_edition'] or 'Auto-detect'}")
+
+    print("\nLocal backups:")
+    local_backups = list_backups(BACKUP_DIR)
+    if local_backups:
+        newest = max(local_backups, key=lambda b: b.dt)
+        oldest = min(local_backups, key=lambda b: b.dt)
+        total_bytes = sum(b.path.stat().st_size for b in local_backups)
+        print(f"  Count: {len(local_backups)}  Total size: {total_bytes / (1024 * 1024):.1f} MB")
+        print(f"  Newest: {newest.path.name} ({_format_age(datetime.now() - newest.dt)} ago)")
+        if oldest.path != newest.path:
+            print(f"  Oldest: {oldest.path.name}")
+    else:
+        print("  None found.")
+    try:
+        usage_path = BACKUP_DIR if BACKUP_DIR.exists() else BACKUP_DIR.parent
+        usage = shutil.disk_usage(usage_path)
+        print(f"  Free disk space on backup volume: {usage.free / (1024 ** 3):.1f} GB")
+    except Exception:
+        pass
+
+    print("\nCloud Backup:")
+    if not cloud_backup_configured():
+        print("  Not configured.")
+    else:
+        cb = SETTINGS["cloud_backup"]
+        print(f"  {'Enabled' if cloud_backup_ready() else 'Configured (disabled)'} — bucket: {cb['bucket']}")
+        print(f"  Encryption: {'Enabled' if cb.get('encrypt_cloud_backups') else 'Disabled'}")
+        if cloud_backup_ready():
+            try:
+                prefix = (cb.get("prefix") or "").strip("/")
+                cloud_backups = list_cloud_backups(cb, prefix=prefix)
+                if cloud_backups:
+                    latest_key, latest_dt = max(cloud_backups, key=lambda item: item[1])
+                    print(f"  Newest cloud backup: {latest_key.rsplit('/', 1)[-1]} ({_format_age(datetime.now() - latest_dt)} ago)")
+                else:
+                    print("  No cloud backups found.")
+            except Exception as e:
+                print(f"  WARNING: Failed to list cloud backups: {e}")
+
+    print("\nNotifications:")
+    if not notifications_configured():
+        print("  Not configured.")
+    else:
+        print(f"  {'Enabled' if notifications_ready() else 'Configured (disabled)'} — type: {SETTINGS['notifications']['type']}")
+
+    newer = check_for_update()
+    print(f"\nSelf-update: {'v' + newer + ' available (run: updater --update)' if newer else 'up to date'}")
 
 def settings_edition_select():
     current_display = SETTINGS["pangolin_edition"] or "Auto-detect"

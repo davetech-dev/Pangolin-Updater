@@ -125,6 +125,23 @@ Confirms the latest backup is actually restorable — downloads it (decrypting f
 0 4 * * 0 /usr/local/bin/updater --verify-backup >> /var/log/pangolin-verify.log 2>&1
 ```
 
+### Checking for image updates
+```bash
+updater --check-updates
+```
+Reports whether a stable upgrade is available for Pangolin, Gerbil, or Traefik, using the exact same rules the interactive `Update` menu uses (Traefik's v3 lock, Pangolin edition awareness, RC/beta filtering) — **but never applies anything.** This is check-only, on purpose: image updates can involve breaking changes or migrations, so applying them is left to the interactive menu where you can review what's changing first.
+
+Sends a notification only when there's something to know (updates found, or the check itself failed) — silent when everything's current. Exit codes: `0` up to date, `1` updates available, `2` the check failed. Good for a daily heads-up without any risk of an unattended update:
+```cron
+0 8 * * * /usr/local/bin/updater --check-updates >> /var/log/pangolin-check-updates.log 2>&1
+```
+
+### Status snapshot
+```bash
+updater --status
+```
+A quick, read-only diagnostic dump: running image versions, Pangolin Edition setting, local backup count/age/disk space, cloud backup freshness (if configured), Notifications state, and whether a newer version of the updater itself is available. Never modifies anything — safe to run anytime, including from a monitoring script.
+
 ---
 
 ## Installation
