@@ -12,6 +12,7 @@ import getpass
 import hashlib
 import hmac
 import http.client
+import socket
 import ssl
 import urllib.error
 import urllib.parse
@@ -116,6 +117,14 @@ DEFAULT_SETTINGS = {
         "encrypt_cloud_backups": False,
         "encryption_passphrase": "",
     },
+    "notifications": {
+        "enabled": False,
+        "type": "",              # "discord" | "slack" | "ntfy" | "generic"
+        "webhook_url": "",       # discord / slack / generic
+        "ntfy_topic_url": "",    # ntfy's URL is a topic, not a generic webhook
+        "notify_on_success": True,
+        "notify_on_failure": True,
+    },
 }
 
 EDITION_OPTIONS = ["Community", "Enterprise"]
@@ -156,6 +165,8 @@ def load_settings():
             merged[key] = data[key]
     if isinstance(data.get("cloud_backup"), dict):
         merged["cloud_backup"].update(data["cloud_backup"])
+    if isinstance(data.get("notifications"), dict):
+        merged["notifications"].update(data["notifications"])
     return merged
 
 def save_settings(settings):
@@ -866,6 +877,72 @@ def cloud_backup_object_key(backup_name):
     prefix = (SETTINGS["cloud_backup"].get("prefix") or "").strip("/")
     return f"{prefix}/{backup_name}".lstrip("/")
 
+# --- Webhook notifications (Discord / Slack / ntfy / generic) ---
+
+def notifications_configured() -> bool:
+    """True if the required fields (type + its URL) are present, regardless of enabled."""
+    n = SETTINGS["notifications"]
+    if not n.get("type"):
+        return False
+    if n["type"] == "ntfy":
+        return bool(n.get("ntfy_topic_url"))
+    return bool(n.get("webhook_url"))
+
+def notifications_ready() -> bool:
+    return bool(SETTINGS["notifications"].get("enabled")) and notifications_configured()
+
+def _send_notification_payload(n: dict, success: bool, summary: str, timeout: float = 10):
+    kind = n["type"]
+    status_word = "succeeded" if success else "failed"
+    icon = "✅" if success else "❌"
+
+    if kind == "discord":
+        url = n["webhook_url"]
+        body = json.dumps({"content": f"{icon} Pangolin backup {status_word}\n{summary}"}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+    elif kind == "slack":
+        url = n["webhook_url"]
+        body = json.dumps({"text": f"{icon} Pangolin backup {status_word}\n{summary}"}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+    elif kind == "ntfy":
+        url = n["ntfy_topic_url"]
+        body = summary.encode("utf-8")
+        headers = {
+            "Title": f"Pangolin Backup {status_word.capitalize()}",
+            "Priority": "default" if success else "high",
+            "Tags": "white_check_mark" if success else "x",
+        }
+    else:  # generic
+        url = n["webhook_url"]
+        body = json.dumps({
+            "success": success,
+            "summary": summary,
+            "host": socket.gethostname(),
+            "timestamp": datetime.now().isoformat(),
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        resp.read()
+
+def send_backup_notification(success: bool, summary: str) -> None:
+    """
+    Best-effort only: never raises, never affects do_backup()'s return value.
+    Prints a WARNING on failure rather than propagating.
+    """
+    if not notifications_ready():
+        return
+    n = SETTINGS["notifications"]
+    if success and not n.get("notify_on_success", True):
+        return
+    if not success and not n.get("notify_on_failure", True):
+        return
+    try:
+        _send_notification_payload(n, success, summary)
+    except Exception as e:
+        print(f"WARNING: Failed to send notification: {e}")
+
 def s3_list_objects(cfg, prefix="", timeout=30):
     """Returns a list of {key, size, last_modified} dicts via ListObjectsV2."""
     scheme, host, canonical_uri = _s3_bucket_target(cfg)
@@ -1269,6 +1346,9 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
         if cleanup_baks in ("y", "yes"):
             removed = cleanup_compose_bak_files()
             print(f"Removed compose backups: {removed}")
+
+    summary = f"host={socket.gethostname()} " + " ".join(summary_lines)
+    send_backup_notification(result, summary)
 
     return result
 
@@ -1944,6 +2024,117 @@ def settings_cloud_test_connection():
     except Exception as e:
         print(f"Failed: {e}")
 
+NOTIFICATION_TYPE_OPTIONS = ["discord", "slack", "ntfy", "generic"]
+
+def settings_notification_field(field, label, secret=False):
+    n = SETTINGS["notifications"]
+    if secret:
+        val = getpass.getpass(f"\nEnter {label} [blank to keep current]: ")
+    else:
+        current = n.get(field) or "not set"
+        val = input(f"\nEnter {label} [blank to keep '{current}']: ").strip()
+    if val == "":
+        return
+    n[field] = val
+    save_settings(SETTINGS)
+    print(f"{label} updated.")
+
+def settings_notification_toggle_field(field, label, default=True):
+    n = SETTINGS["notifications"]
+    current = n.get(field, default)
+    val = input(f"\n{label}? (Y/N) [current: {'Y' if current else 'N'}]: ").strip().lower()
+    if val in ("y", "yes"):
+        n[field] = True
+    elif val in ("n", "no"):
+        n[field] = False
+    else:
+        return
+    save_settings(SETTINGS)
+    print(f"{label}: {'Yes' if n[field] else 'No'}")
+
+def settings_notifications_type_select():
+    n = SETTINGS["notifications"]
+    print("\nNotification provider type:")
+    for i, opt in enumerate(NOTIFICATION_TYPE_OPTIONS, start=1):
+        marker = " (Current)" if opt == n.get("type") else ""
+        print(f"  [{i}] {opt}{marker}")
+    val = input(f"Choose number [blank to keep '{n.get('type') or 'not set'}']: ").strip()
+    if val == "":
+        return
+    if val.isdigit() and 1 <= int(val) <= len(NOTIFICATION_TYPE_OPTIONS):
+        n["type"] = NOTIFICATION_TYPE_OPTIONS[int(val) - 1]
+        save_settings(SETTINGS)
+        print(f"Provider type set to: {n['type']}")
+    else:
+        print("Invalid choice.")
+
+def settings_notifications_toggle():
+    n = SETTINGS["notifications"]
+    if not n.get("enabled") and not notifications_configured():
+        print("\nNotifications can't be enabled yet — set Provider Type and its Webhook/Topic URL first.")
+        return
+    val = input(f"\nEnable Notifications? (Y/N) [current: {'Y' if n.get('enabled') else 'N'}]: ").strip().lower()
+    if val in ("y", "yes"):
+        n["enabled"] = True
+    elif val in ("n", "no"):
+        n["enabled"] = False
+    else:
+        return
+    save_settings(SETTINGS)
+    print(f"Notifications: {'Enabled' if n['enabled'] else 'Disabled'}")
+
+def settings_notifications_test():
+    if not notifications_configured():
+        print("\nSet Provider Type and its Webhook/Topic URL first.")
+        return
+    print("\nSending a test notification...")
+    try:
+        _send_notification_payload(SETTINGS["notifications"], True, "Test notification from pangolin-updater Settings.")
+        print("Success: notification sent.")
+    except Exception as e:
+        print(f"Failed: {e}")
+
+def do_settings_notifications():
+    while True:
+        render_screen("Settings > Notifications")
+        n = SETTINGS["notifications"]
+        url_field = "ntfy_topic_url" if n.get("type") == "ntfy" else "webhook_url"
+        url_label = "Topic URL" if n.get("type") == "ntfy" else "Webhook URL"
+        print(f"[1] Enable/Disable          (current: {'Enabled' if n.get('enabled') else 'Disabled'})")
+        print(f"[2] Provider Type           (current: {n.get('type') or 'not set'})")
+        print(f"[3] {url_label:<27} (current: {'set' if n.get(url_field) else 'not set'})")
+        print(f"[4] Notify on Success       (current: {'Yes' if n.get('notify_on_success', True) else 'No'})")
+        print(f"[5] Notify on Failure       (current: {'Yes' if n.get('notify_on_failure', True) else 'No'})")
+        print("[6] Send Test Notification")
+        print("[7] Back to Settings")
+        if not notifications_configured():
+            print("\nNote: Provider Type and its Webhook/Topic URL are required before enabling.")
+        choice = input("Select an option [1-7]: ").strip()
+
+        if choice == "1":
+            settings_notifications_toggle()
+            pause()
+        elif choice == "2":
+            settings_notifications_type_select()
+            pause()
+        elif choice == "3":
+            settings_notification_field(url_field, url_label)
+            pause()
+        elif choice == "4":
+            settings_notification_toggle_field("notify_on_success", "Notify on Success")
+            pause()
+        elif choice == "5":
+            settings_notification_toggle_field("notify_on_failure", "Notify on Failure")
+            pause()
+        elif choice == "6":
+            settings_notifications_test()
+            pause()
+        elif choice == "7":
+            return
+        else:
+            print("Invalid option.")
+            pause()
+
 def do_settings_cloud_backup():
     while True:
         render_screen("Settings > Cloud Backup")
@@ -2020,12 +2211,20 @@ def do_settings():
             cb_display = "Configured (disabled)"
         else:
             cb_display = "Not configured"
+        n = SETTINGS["notifications"]
+        if n.get("enabled"):
+            n_display = "Enabled"
+        elif notifications_configured():
+            n_display = "Configured (disabled)"
+        else:
+            n_display = "Not configured"
         print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition'] or 'Auto-detect'})")
         print(f"[2] Pangolin Root Directory   (current: {ROOT_DIR})")
         print(f"[3] Backup Path               (current: {backup_display})")
         print(f"[4] Cloud Backup              (current: {cb_display})")
-        print("[5] Back to Main Menu")
-        choice = input("Select an option [1-5]: ").strip()
+        print(f"[5] Notifications             (current: {n_display})")
+        print("[6] Back to Main Menu")
+        choice = input("Select an option [1-6]: ").strip()
 
         if choice == "1":
             settings_edition_select()
@@ -2039,6 +2238,8 @@ def do_settings():
         elif choice == "4":
             do_settings_cloud_backup()
         elif choice == "5":
+            do_settings_notifications()
+        elif choice == "6":
             return
         else:
             print("Invalid option.")
