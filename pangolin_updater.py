@@ -24,16 +24,14 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 __app_name__ = "pangolin-updater"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_CYAN = "\033[36m"
 
-
 def is_tty():
     return sys.stdout.isatty()
-
 
 def ui_text(text, color=None, bold=False):
     if not is_tty():
@@ -47,20 +45,17 @@ def ui_text(text, color=None, bold=False):
     parts.append(ANSI_RESET)
     return "".join(parts)
 
-
 def term_width(default=80):
     try:
         return shutil.get_terminal_size((default, 24)).columns
     except Exception:
         return default
 
-
 def clear_screen():
     if is_tty():
         # ANSI clear screen + move cursor to home.
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
-
 
 def print_banner():
     cols = term_width()
@@ -74,13 +69,11 @@ def print_banner():
     print(ui_text(f" {__app_name__} v{__version__} ".center(width), color=ANSI_CYAN, bold=True))
     print(line)
 
-
 def print_section(title):
     cols = term_width()
     width = min(cols, 110) if cols >= 50 else cols
     print(ui_text(title, bold=True))
     print("-" * max(1, min(width, max(len(title), 24))))
-
 
 def render_screen(title):
     if not is_tty():
@@ -94,7 +87,6 @@ def render_screen(title):
 def pause():
     """Holds the screen so output isn't wiped by the next render_screen() clear."""
     input("\nPress Enter to continue...")
-
 
 # Settings file lives at a fixed location independent of root_dir, since
 # root_dir itself is one of the settings it stores.
@@ -645,7 +637,6 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
         tags.append(tag)
     return tags
 
-
 # --- Cloud Backup: S3-compatible object storage (MinIO, AWS S3, etc.) ---
 #
 # Implemented directly against the AWS Signature Version 4 protocol using
@@ -846,47 +837,28 @@ def _s3_sign(cfg, method, host, canonical_uri, headers, payload_hash, canonical_
 def _s3_amzdate():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-def s3_put_bytes(cfg, key, data: bytes, content_type="application/octet-stream", timeout=30):
+def _s3_simple_request(cfg, method, key, payload=b"", extra_headers=None, ok_statuses=(200, 201), timeout=30):
+    """Shared connect/sign/request/close dance for single-shot (non-streamed) S3 calls."""
     scheme, host, canonical_uri = _s3_object_target(cfg, key)
-    payload_hash = hashlib.sha256(data).hexdigest()
-    headers = {
-        "host": host,
-        "x-amz-date": _s3_amzdate(),
-        "x-amz-content-sha256": payload_hash,
-        "content-type": content_type,
-        "content-length": str(len(data)),
-    }
-    headers["authorization"] = _s3_sign(cfg, "PUT", host, canonical_uri, headers, payload_hash)
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    headers = {"host": host, "x-amz-date": _s3_amzdate(), "x-amz-content-sha256": payload_hash, **(extra_headers or {})}
+    headers["authorization"] = _s3_sign(cfg, method, host, canonical_uri, headers, payload_hash)
 
     conn = _s3_connect(cfg, scheme, host, timeout)
     try:
-        conn.request("PUT", canonical_uri, body=data, headers=headers)
+        conn.request(method, canonical_uri, body=payload or None, headers=headers)
         resp = conn.getresponse()
         body = resp.read()
-        if resp.status not in (200, 201):
-            raise RuntimeError(f"S3 PUT failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
+        if resp.status not in ok_statuses:
+            raise RuntimeError(f"S3 {method} failed ({resp.status}): {body[:300].decode('utf-8', 'replace')}")
     finally:
         conn.close()
+
+def s3_put_bytes(cfg, key, data: bytes, content_type="application/octet-stream", timeout=30):
+    _s3_simple_request(cfg, "PUT", key, payload=data, extra_headers={"content-type": content_type, "content-length": str(len(data))}, timeout=timeout)
 
 def s3_delete(cfg, key, timeout=30):
-    scheme, host, canonical_uri = _s3_object_target(cfg, key)
-    payload_hash = hashlib.sha256(b"").hexdigest()
-    headers = {
-        "host": host,
-        "x-amz-date": _s3_amzdate(),
-        "x-amz-content-sha256": payload_hash,
-    }
-    headers["authorization"] = _s3_sign(cfg, "DELETE", host, canonical_uri, headers, payload_hash)
-
-    conn = _s3_connect(cfg, scheme, host, timeout)
-    try:
-        conn.request("DELETE", canonical_uri, headers=headers)
-        resp = conn.getresponse()
-        resp.read()
-        if resp.status not in (200, 202, 204):
-            raise RuntimeError(f"S3 DELETE failed ({resp.status})")
-    finally:
-        conn.close()
+    _s3_simple_request(cfg, "DELETE", key, ok_statuses=(200, 202, 204), timeout=timeout)
 
 def s3_put_file(cfg, local_path: Path, key, content_type="application/gzip", timeout=600):
     """Streams local_path to the object store; never loads the whole file into memory."""
@@ -952,14 +924,10 @@ def _send_notification_payload(n: dict, success: bool, summary: str, event_label
     icon = "✅" if success else "❌"
     title = f"{icon} Pangolin {event_label} {status_word}"
 
-    if kind == "discord":
+    headers = {"Content-Type": "application/json"}
+    if kind in ("discord", "slack"):
         url = n["webhook_url"]
-        body = json.dumps({"content": f"{title}\n{summary}"}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-    elif kind == "slack":
-        url = n["webhook_url"]
-        body = json.dumps({"text": f"{title}\n{summary}"}).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        body = json.dumps({"content" if kind == "discord" else "text": f"{title}\n{summary}"}).encode("utf-8")
     elif kind == "ntfy":
         url = n["ntfy_topic_url"]
         body = summary.encode("utf-8")
@@ -971,13 +939,9 @@ def _send_notification_payload(n: dict, success: bool, summary: str, event_label
     else:  # generic
         url = n["webhook_url"]
         body = json.dumps({
-            "event": event_label.lower(),
-            "success": success,
-            "summary": summary,
-            "host": socket.gethostname(),
-            "timestamp": datetime.now().isoformat(),
+            "event": event_label.lower(), "success": success, "summary": summary,
+            "host": socket.gethostname(), "timestamp": datetime.now().isoformat(),
         }).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
 
     # Some providers (Discord's Cloudflare front-end in particular) reject
     # requests with no User-Agent as bot traffic, regardless of payload
@@ -1654,7 +1618,6 @@ def apply_cloud_backup_retention(cfg: dict, prefix: str = "", now: datetime | No
 
     return (kept, deleted)
 
-
 def check_for_image_updates():
     """
     Non-interactive: for each managed image, reports whether a stable
@@ -1687,7 +1650,6 @@ def check_for_image_updates():
         latest = full_tag(upgrades[0]) if upgrades else old
         results.append({"key": key, "display": meta["display"], "current": old, "latest": latest, "has_update": bool(upgrades), "error": None})
     return results
-
 
 def do_update():
     render_screen("Update")
@@ -2080,7 +2042,6 @@ def do_restore():
     print("\nRestore complete. Stack restarted.")
     send_notification(True, f"host={socket.gethostname()} restored from {selected.path.name}", event_label="Restore")
 
-
 def do_verify_backup(source_override: str | None = None) -> bool:
     """
     Verifies the latest backup is structurally sound and restorable, WITHOUT
@@ -2149,7 +2110,6 @@ def do_verify_backup(source_override: str | None = None) -> bool:
     summary = f"host={socket.gethostname()} source={source} backup={target_desc} " + ("verification passed" if ok else f"verification FAILED: {msg}")
     send_notification(ok, summary, event_label="Verify")
     return ok
-
 
 def _format_age(delta: timedelta) -> str:
     total_seconds = max(int(delta.total_seconds()), 0)
@@ -2275,46 +2235,44 @@ def _mask_secret_display(val, shown_prefix_len=4):
         return "set"
     return val[:shown_prefix_len] + "…"
 
-def settings_cloud_field(field, label, secret=False):
-    cb = SETTINGS["cloud_backup"]
+def settings_field(section, field, label, secret=False):
+    s = SETTINGS[section]
     if secret:
         val = getpass.getpass(f"\nEnter {label} [blank to keep current]: ")
     else:
-        current = cb.get(field) or "not set"
-        val = input(f"\nEnter {label} [blank to keep '{current}']: ").strip()
+        val = input(f"\nEnter {label} [blank to keep '{s.get(field) or 'not set'}']: ").strip()
     if val == "":
         return
-    cb[field] = val
+    s[field] = val
     save_settings(SETTINGS)
     print(f"{label} updated.")
 
-def settings_cloud_toggle_field(field, label, default=True):
-    cb = SETTINGS["cloud_backup"]
-    current = cb.get(field, default)
-    val = input(f"\n{label}? (Y/N) [current: {'Y' if current else 'N'}]: ").strip().lower()
+def settings_toggle_field(section, field, label, default=True):
+    s = SETTINGS[section]
+    val = input(f"\n{label}? (Y/N) [current: {'Y' if s.get(field, default) else 'N'}]: ").strip().lower()
     if val in ("y", "yes"):
-        cb[field] = True
+        s[field] = True
     elif val in ("n", "no"):
-        cb[field] = False
+        s[field] = False
     else:
         return
     save_settings(SETTINGS)
-    print(f"{label}: {'Yes' if cb[field] else 'No'}")
+    print(f"{label}: {'Yes' if s[field] else 'No'}")
 
-def settings_cloud_backup_toggle():
-    cb = SETTINGS["cloud_backup"]
-    if not cb.get("enabled") and not cloud_backup_configured():
-        print("\nCloud Backup can't be enabled yet — set Endpoint, Bucket, Access Key, and Secret Key first.")
+def settings_enable_toggle(section, label, configured_fn, requirements_msg):
+    s = SETTINGS[section]
+    if not s.get("enabled") and not configured_fn():
+        print(f"\n{label} can't be enabled yet — {requirements_msg}")
         return
-    val = input(f"\nEnable Cloud Backup? (Y/N) [current: {'Y' if cb.get('enabled') else 'N'}]: ").strip().lower()
+    val = input(f"\nEnable {label}? (Y/N) [current: {'Y' if s.get('enabled') else 'N'}]: ").strip().lower()
     if val in ("y", "yes"):
-        cb["enabled"] = True
+        s["enabled"] = True
     elif val in ("n", "no"):
-        cb["enabled"] = False
+        s["enabled"] = False
     else:
         return
     save_settings(SETTINGS)
-    print(f"Cloud Backup: {'Enabled' if cb['enabled'] else 'Disabled'}")
+    print(f"{label}: {'Enabled' if s['enabled'] else 'Disabled'}")
 
 def settings_cloud_test_connection():
     cb = SETTINGS["cloud_backup"]
@@ -2329,32 +2287,6 @@ def settings_cloud_test_connection():
         print(f"Failed: {e}")
 
 NOTIFICATION_TYPE_OPTIONS = ["discord", "slack", "ntfy", "generic"]
-
-def settings_notification_field(field, label, secret=False):
-    n = SETTINGS["notifications"]
-    if secret:
-        val = getpass.getpass(f"\nEnter {label} [blank to keep current]: ")
-    else:
-        current = n.get(field) or "not set"
-        val = input(f"\nEnter {label} [blank to keep '{current}']: ").strip()
-    if val == "":
-        return
-    n[field] = val
-    save_settings(SETTINGS)
-    print(f"{label} updated.")
-
-def settings_notification_toggle_field(field, label, default=True):
-    n = SETTINGS["notifications"]
-    current = n.get(field, default)
-    val = input(f"\n{label}? (Y/N) [current: {'Y' if current else 'N'}]: ").strip().lower()
-    if val in ("y", "yes"):
-        n[field] = True
-    elif val in ("n", "no"):
-        n[field] = False
-    else:
-        return
-    save_settings(SETTINGS)
-    print(f"{label}: {'Yes' if n[field] else 'No'}")
 
 def settings_notifications_type_select():
     n = SETTINGS["notifications"]
@@ -2371,21 +2303,6 @@ def settings_notifications_type_select():
         print(f"Provider type set to: {n['type']}")
     else:
         print("Invalid choice.")
-
-def settings_notifications_toggle():
-    n = SETTINGS["notifications"]
-    if not n.get("enabled") and not notifications_configured():
-        print("\nNotifications can't be enabled yet — set Provider Type and its Webhook/Topic URL first.")
-        return
-    val = input(f"\nEnable Notifications? (Y/N) [current: {'Y' if n.get('enabled') else 'N'}]: ").strip().lower()
-    if val in ("y", "yes"):
-        n["enabled"] = True
-    elif val in ("n", "no"):
-        n["enabled"] = False
-    else:
-        return
-    save_settings(SETTINGS)
-    print(f"Notifications: {'Enabled' if n['enabled'] else 'Disabled'}")
 
 def settings_notifications_test():
     if not notifications_configured():
@@ -2415,29 +2332,21 @@ def do_settings_notifications():
             print("\nNote: Provider Type and its Webhook/Topic URL are required before enabling.")
         choice = input("Select an option [1-7]: ").strip()
 
-        if choice == "1":
-            settings_notifications_toggle()
-            pause()
-        elif choice == "2":
-            settings_notifications_type_select()
-            pause()
-        elif choice == "3":
-            settings_notification_field(url_field, url_label)
-            pause()
-        elif choice == "4":
-            settings_notification_toggle_field("notify_on_success", "Notify on Success")
-            pause()
-        elif choice == "5":
-            settings_notification_toggle_field("notify_on_failure", "Notify on Failure")
-            pause()
-        elif choice == "6":
-            settings_notifications_test()
-            pause()
-        elif choice == "7":
+        if choice == "7":
             return
+        actions = {
+            "1": lambda: settings_enable_toggle("notifications", "Notifications", notifications_configured, "set Provider Type and its Webhook/Topic URL first."),
+            "2": settings_notifications_type_select,
+            "3": lambda: settings_field("notifications", url_field, url_label),
+            "4": lambda: settings_toggle_field("notifications", "notify_on_success", "Notify on Success"),
+            "5": lambda: settings_toggle_field("notifications", "notify_on_failure", "Notify on Failure"),
+            "6": settings_notifications_test,
+        }
+        if choice in actions:
+            actions[choice]()
         else:
             print("Invalid option.")
-            pause()
+        pause()
 
 def do_settings_cloud_backup():
     while True:
@@ -2460,47 +2369,32 @@ def do_settings_cloud_backup():
             print("\nNote: Endpoint, Bucket, Access Key, and Secret Key are all required before enabling.")
         choice = input("Select an option [1-13]: ").strip()
 
-        if choice == "1":
-            settings_cloud_backup_toggle()
-            pause()
-        elif choice == "2":
-            settings_cloud_field("endpoint", "Endpoint URL (e.g. https://minio.example.com:9000)")
-            pause()
-        elif choice == "3":
-            settings_cloud_field("bucket", "Bucket name")
-            pause()
-        elif choice == "4":
-            settings_cloud_field("access_key", "Access Key")
-            pause()
-        elif choice == "5":
-            settings_cloud_field("secret_key", "Secret Key", secret=True)
-            pause()
-        elif choice == "6":
-            settings_cloud_field("region", "Region (MinIO default: us-east-1)")
-            pause()
-        elif choice == "7":
-            settings_cloud_field("prefix", "Path prefix (e.g. pangolin/, blank for bucket root)")
-            pause()
-        elif choice == "8":
-            settings_cloud_toggle_field("use_path_style", "Use path-style addressing (required by most MinIO setups)")
-            pause()
-        elif choice == "9":
-            settings_cloud_toggle_field("verify_ssl", "Verify SSL certificate (disable only for self-signed MinIO)")
-            pause()
-        elif choice == "10":
-            settings_cloud_toggle_field("encrypt_cloud_backups", "Encrypt cloud backups (requires openssl on this system)")
-            pause()
-        elif choice == "11":
-            settings_cloud_field("encryption_passphrase", "Encryption Passphrase", secret=True)
-            pause()
-        elif choice == "12":
-            settings_cloud_test_connection()
-            pause()
-        elif choice == "13":
+        if choice == "13":
             return
+        actions = {
+            "1": lambda: settings_enable_toggle("cloud_backup", "Cloud Backup", cloud_backup_configured, "set Endpoint, Bucket, Access Key, and Secret Key first."),
+            "2": lambda: settings_field("cloud_backup", "endpoint", "Endpoint URL (e.g. https://minio.example.com:9000)"),
+            "3": lambda: settings_field("cloud_backup", "bucket", "Bucket name"),
+            "4": lambda: settings_field("cloud_backup", "access_key", "Access Key"),
+            "5": lambda: settings_field("cloud_backup", "secret_key", "Secret Key", secret=True),
+            "6": lambda: settings_field("cloud_backup", "region", "Region (MinIO default: us-east-1)"),
+            "7": lambda: settings_field("cloud_backup", "prefix", "Path prefix (e.g. pangolin/, blank for bucket root)"),
+            "8": lambda: settings_toggle_field("cloud_backup", "use_path_style", "Use path-style addressing (required by most MinIO setups)"),
+            "9": lambda: settings_toggle_field("cloud_backup", "verify_ssl", "Verify SSL certificate (disable only for self-signed MinIO)"),
+            "10": lambda: settings_toggle_field("cloud_backup", "encrypt_cloud_backups", "Encrypt cloud backups (requires openssl on this system)"),
+            "11": lambda: settings_field("cloud_backup", "encryption_passphrase", "Encryption Passphrase", secret=True),
+            "12": settings_cloud_test_connection,
+        }
+        if choice in actions:
+            actions[choice]()
         else:
             print("Invalid option.")
-            pause()
+        pause()
+
+def _feature_status(section, configured_fn):
+    if SETTINGS[section].get("enabled"):
+        return "Enabled"
+    return "Configured (disabled)" if configured_fn() else "Not configured"
 
 def do_settings():
     while True:
@@ -2508,20 +2402,8 @@ def do_settings():
         backup_display = str(BACKUP_DIR)
         if not SETTINGS.get("backup_path"):
             backup_display += "  (default)"
-        cb = SETTINGS["cloud_backup"]
-        if cb.get("enabled"):
-            cb_display = "Enabled"
-        elif cloud_backup_configured():
-            cb_display = "Configured (disabled)"
-        else:
-            cb_display = "Not configured"
-        n = SETTINGS["notifications"]
-        if n.get("enabled"):
-            n_display = "Enabled"
-        elif notifications_configured():
-            n_display = "Configured (disabled)"
-        else:
-            n_display = "Not configured"
+        cb_display = _feature_status("cloud_backup", cloud_backup_configured)
+        n_display = _feature_status("notifications", notifications_configured)
         print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition'] or 'Auto-detect'})")
         print(f"[2] Pangolin Root Directory   (current: {ROOT_DIR})")
         print(f"[3] Backup Path               (current: {backup_display})")
