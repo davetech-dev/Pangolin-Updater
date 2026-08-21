@@ -89,7 +89,7 @@ def render_screen(title):
 SETTINGS_FILE = Path("/etc/pangolin-updater/settings.json")
 
 DEFAULT_SETTINGS = {
-    "pangolin_edition": "Community",
+    "pangolin_edition": "",  # empty = auto-detect from the currently deployed image tag
     "root_dir": "/root",
     "backup_path": "",  # empty = derive from root_dir/backup
     "cloud_backup": {
@@ -99,6 +99,28 @@ DEFAULT_SETTINGS = {
 }
 
 EDITION_OPTIONS = ["Community", "Enterprise"]
+
+# Docker Hub tag prefix fosrl/pangolin uses per edition (GitHub release tags
+# themselves are always bare, e.g. "1.21.1" — the prefix is Docker Hub-only).
+PANGOLIN_EDITION_PREFIXES = {
+    "Enterprise": "ee-",
+    "Community": "",
+}
+
+def detect_pangolin_tag(tag):
+    """
+    Splits a deployed fosrl/pangolin tag into (edition, bare_version).
+    Returns (None, tag) if the tag uses a variant this tool doesn't model
+    yet (e.g. the postgresql- database variant), so callers can fall back
+    to treating it as an opaque tag rather than mangling it.
+    """
+    if not tag:
+        return (None, tag)
+    if "postgresql-" in tag:
+        return (None, tag)
+    if tag.startswith("ee-"):
+        return ("Enterprise", tag[len("ee-"):])
+    return ("Community", tag)
 
 def load_settings():
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
@@ -313,8 +335,14 @@ def classify_change(old_tag, new_tag):
         return "Unchanged"
     # Best-effort semantic-ish comparison:
     # - strip leading 'v' for traefik style tags
+    # - strip known fosrl/pangolin edition prefixes so "ee-1.22.0" compares
+    #   correctly against "ee-1.21.1" instead of falling back to lexical compare
     def norm(t):
-        return t[1:] if t and t.startswith("v") else t
+        if not t:
+            return t
+        _, bare = detect_pangolin_tag(t)
+        t = bare if bare is not None else t
+        return t[1:] if t.startswith("v") else t
 
     o = norm(old_tag)
     n = norm(new_tag)
@@ -420,7 +448,7 @@ def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
         if rel.get("draft") or rel.get("prerelease"):
             continue
         tag_l = tag.lower()
-        if "-rc" in tag_l or "-ea" in tag_l:
+        if any(marker in tag_l for marker in ("-rc", "-ea", "-beta", "-alpha", "-preview", "-dev")):
             continue
         tags.append(tag)
     return tags
@@ -457,11 +485,32 @@ def safe_extract_tar(tar, destination: Path):
     for member in safe_members:
         tar.extract(member, path=base_dir)
 
-def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from_tag=None):
+def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from_tag=None, pangolin_edition_setting=None):
     display = meta["display"]
     github_repo = meta.get("github_repo")
     release_url = meta.get("release_url")
     upgrade_note = meta.get("upgrade_note")
+
+    # Edition-aware handling (Pangolin only): GitHub release tags are always
+    # bare (e.g. "1.21.1"), but Docker Hub prefixes Enterprise Edition images
+    # with "ee-". pangolin_edition_setting is None for gerbil/traefik.
+    use_edition_logic = False
+    edition_prefix = ""
+    compare_basis = current_tag
+    if pangolin_edition_setting is not None:
+        detected_edition, bare_current = detect_pangolin_tag(current_tag)
+        if detected_edition is None:
+            print(f"  Warning: current tag '{current_tag}' uses a variant (e.g. Postgres) this tool doesn't manage edition-wise yet; select/enter tags manually.")
+        else:
+            target_edition = pangolin_edition_setting if pangolin_edition_setting in PANGOLIN_EDITION_PREFIXES else detected_edition
+            edition_prefix = PANGOLIN_EDITION_PREFIXES[target_edition]
+            compare_basis = bare_current
+            use_edition_logic = True
+            if target_edition != detected_edition:
+                print(f"  NOTE: Settings > Pangolin Edition is '{target_edition}', but the running image is '{detected_edition}'. Picking an update below will switch editions ({detected_edition} -> {target_edition}).")
+
+    def full_tag(bare):
+        return f"{edition_prefix}{bare}" if use_edition_logic else bare
 
     def annotation_for(tag):
         if not annotate_from_tag:
@@ -535,13 +584,13 @@ def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from
 
     # If current tag is non-semver-like (e.g. "latest"), still show stable
     # release options so users can pick a concrete version from the menu.
-    current_parsed = parse_version_tuple(current_tag)
+    current_parsed = parse_version_tuple(compare_basis)
     if current_parsed is None:
         upgrades = list(unique_tags)
         downgrades = []
     else:
-        upgrades = [t for t in unique_tags if compare_versions(t, current_tag) > 0]
-        downgrades = [t for t in unique_tags if compare_versions(t, current_tag) < 0]
+        upgrades = [t for t in unique_tags if compare_versions(t, compare_basis) > 0]
+        downgrades = [t for t in unique_tags if compare_versions(t, compare_basis) < 0]
 
     # Sort upgrades newest first.
     upgrades.sort(key=lambda t: parse_version_tuple(t), reverse=True)
@@ -554,18 +603,18 @@ def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from
     option_map = {}
     idx = 1
     for tag in upgrades:
-        option_map[idx] = tag
-        print(f"  [{idx}] {tag} (Upgrade){annotation_for(tag)}")
+        option_map[idx] = full_tag(tag)
+        print(f"  [{idx}] {full_tag(tag)} (Upgrade){annotation_for(tag)}")
         idx += 1
 
     current_idx = idx
     option_map[current_idx] = current_tag
-    print(f"  [{current_idx}] {style_current_tag(current_tag)} (Current){annotation_for(current_tag)}")
+    print(f"  [{current_idx}] {style_current_tag(current_tag)} (Current){annotation_for(compare_basis)}")
     idx += 1
 
     if one_downgrade is not None:
-        option_map[idx] = one_downgrade
-        print(f"  [{idx}] {one_downgrade} (Downgrade){annotation_for(one_downgrade)}")
+        option_map[idx] = full_tag(one_downgrade)
+        print(f"  [{idx}] {full_tag(one_downgrade)} (Downgrade){annotation_for(one_downgrade)}")
 
     if len(upgrades) == 0:
         print("  No stable upgrades found; keeping current is recommended.")
@@ -769,10 +818,12 @@ def do_update():
         old = current.get(key)
         major_version_lock = traefik_lock["current_traefik_version_tag"] if key == "traefik" else None
         annotate_from_tag = traefik_lock["pangolin_last_update_for_traefik_update_to_v4"] if key == "pangolin" else None
+        pangolin_edition_setting = SETTINGS["pangolin_edition"] if key == "pangolin" else None
         selections[key] = select_release_tag(
             meta, old,
             major_version_lock=major_version_lock,
             annotate_from_tag=annotate_from_tag,
+            pangolin_edition_setting=pangolin_edition_setting,
         )
 
     print("\nPlanned changes:")
@@ -1015,19 +1066,25 @@ def do_restore():
 
 
 def settings_edition_select():
+    current_display = SETTINGS["pangolin_edition"] or "Auto-detect"
     print("\nPangolin Edition:")
     for i, opt in enumerate(EDITION_OPTIONS, start=1):
         marker = " (Current)" if opt == SETTINGS["pangolin_edition"] else ""
         print(f"  [{i}] {opt}{marker}")
-    val = input(f"Choose number, or type a custom value [blank to keep '{SETTINGS['pangolin_edition']}']: ").strip()
+    auto_idx = len(EDITION_OPTIONS) + 1
+    marker = " (Current)" if not SETTINGS["pangolin_edition"] else ""
+    print(f"  [{auto_idx}] Auto-detect (matches whatever image is currently deployed){marker}")
+    val = input(f"Choose number [blank to keep '{current_display}']: ").strip()
     if val == "":
         return
     if val.isdigit() and 1 <= int(val) <= len(EDITION_OPTIONS):
         SETTINGS["pangolin_edition"] = EDITION_OPTIONS[int(val) - 1]
+    elif val.isdigit() and int(val) == auto_idx:
+        SETTINGS["pangolin_edition"] = ""
     else:
         SETTINGS["pangolin_edition"] = val
     save_settings(SETTINGS)
-    print(f"Edition set to: {SETTINGS['pangolin_edition']}")
+    print(f"Edition set to: {SETTINGS['pangolin_edition'] or 'Auto-detect'}")
 
 def settings_root_directory():
     val = input(f"\nEnter new Pangolin root directory [blank to keep '{ROOT_DIR}']: ").strip()
@@ -1070,7 +1127,7 @@ def do_settings():
         if not SETTINGS.get("backup_path"):
             backup_display += "  (default)"
         cb_display = "Enabled" if SETTINGS["cloud_backup"].get("enabled") else "Disabled"
-        print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition']})")
+        print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition'] or 'Auto-detect'})")
         print(f"[2] Pangolin Root Directory   (current: {ROOT_DIR})")
         print(f"[3] Backup Path               (current: {backup_display})")
         print(f"[4] Cloud Backup              (current: {cb_display})")
