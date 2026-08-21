@@ -89,6 +89,10 @@ def render_screen(title):
     print_banner()
     print_section(title)
 
+def pause():
+    """Holds the screen so output isn't wiped by the next render_screen() clear."""
+    input("\nPress Enter to continue...")
+
 
 # Settings file lives at a fixed location independent of root_dir, since
 # root_dir itself is one of the settings it stores.
@@ -1585,28 +1589,39 @@ def do_settings_cloud_backup():
 
         if choice == "1":
             settings_cloud_backup_toggle()
+            pause()
         elif choice == "2":
             settings_cloud_field("endpoint", "Endpoint URL (e.g. https://minio.example.com:9000)")
+            pause()
         elif choice == "3":
             settings_cloud_field("bucket", "Bucket name")
+            pause()
         elif choice == "4":
             settings_cloud_field("access_key", "Access Key")
+            pause()
         elif choice == "5":
             settings_cloud_field("secret_key", "Secret Key", secret=True)
+            pause()
         elif choice == "6":
             settings_cloud_field("region", "Region (MinIO default: us-east-1)")
+            pause()
         elif choice == "7":
             settings_cloud_field("prefix", "Path prefix (e.g. pangolin/, blank for bucket root)")
+            pause()
         elif choice == "8":
             settings_cloud_toggle_field("use_path_style", "Use path-style addressing (required by most MinIO setups)")
+            pause()
         elif choice == "9":
             settings_cloud_toggle_field("verify_ssl", "Verify SSL certificate (disable only for self-signed MinIO)")
+            pause()
         elif choice == "10":
             settings_cloud_test_connection()
+            pause()
         elif choice == "11":
             return
         else:
             print("Invalid option.")
+            pause()
 
 def do_settings():
     while True:
@@ -1630,16 +1645,20 @@ def do_settings():
 
         if choice == "1":
             settings_edition_select()
+            pause()
         elif choice == "2":
             settings_root_directory()
+            pause()
         elif choice == "3":
             settings_backup_path()
+            pause()
         elif choice == "4":
             do_settings_cloud_backup()
         elif choice == "5":
             return
         else:
             print("Invalid option.")
+            pause()
 
 def main():
     handle_cli_flags()
@@ -1656,10 +1675,13 @@ def main():
 
         if choice == "1":
             do_backup()
+            pause()
         elif choice == "2":
             do_update()
+            pause()
         elif choice == "3":
             do_restore()
+            pause()
         elif choice == "4":
             do_settings()
         elif choice == "5":
@@ -1667,6 +1689,7 @@ def main():
             return
         else:
             print("Invalid option.")
+            pause()
 
 if __name__ == "__main__":
     try:
