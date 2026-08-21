@@ -92,6 +92,30 @@ updater --update
 ```
 Downloads and installs the latest version from GitHub in place. No-ops if already up to date; add `--force` to reinstall anyway.
 
+### Scheduled backups (cron)
+```bash
+updater --backup
+```
+Runs a full backup with no interactive prompts — creates the archive, verifies its integrity, uploads to Cloud Backup if configured (encrypting first if enabled), applies local and cloud retention, and sends a webhook notification if one is configured. Exits `0` on success, non-zero on failure, so it's safe to alert on in a scheduler.
+
+By default it uses Cloud Backup + Local if Cloud Backup is enabled in Settings, otherwise Local only. Override explicitly with:
+```bash
+updater --backup --destination=local   # local only
+updater --backup --destination=cloud   # cloud only
+updater --backup --destination=both    # local + cloud
+```
+
+Cloud Backup, encryption, and Notifications are all configured ahead of time via `updater`'s interactive `Settings` menu — `--backup` just uses whatever's already set there, since it never prompts.
+
+This isn't installed automatically — add it yourself via `crontab -e` (as root, since the updater requires root). Example: run daily at 3:00 AM, with output logged for later inspection:
+```cron
+0 3 * * * /usr/local/bin/updater --backup >> /var/log/pangolin-backup.log 2>&1
+```
+Or every 6 hours:
+```cron
+0 */6 * * * /usr/local/bin/updater --backup >> /var/log/pangolin-backup.log 2>&1
+```
+
 ---
 
 ## Installation
