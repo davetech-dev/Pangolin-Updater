@@ -1028,6 +1028,24 @@ def _backup_tar_filter(tarinfo):
         return None
     return tarinfo
 
+def verify_backup_integrity(backup_path: Path) -> tuple[bool, str]:
+    """
+    Forces a full read of the gzip+tar stream (tarfile raises on truncation
+    or corruption) without extracting any payload to disk, then checks the
+    two mandatory top-level entries are present. Returns (ok, message).
+    """
+    try:
+        with tarfile.open(backup_path, "r:gz") as tar:
+            names = tar.getnames()
+    except Exception as e:
+        return False, f"could not read archive: {e}"
+
+    if "docker-compose.yml" not in names:
+        return False, "archive is missing docker-compose.yml"
+    if not any(n == "config" or n.startswith("config/") for n in names):
+        return False, "archive is missing the config/ directory"
+    return True, "ok"
+
 def _default_backup_destination():
     """Used when do_backup() runs non-interactively (e.g. `updater --backup`)
     with no explicit destination_override: prefer cloud+local if cloud is
@@ -1060,39 +1078,55 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
 
     print(f"\nBackup created: {backup_path}")
 
-    if destination_override is not None:
-        destination = destination_override
-    elif interactive:
-        destination = prompt_backup_destination()
-    else:
-        destination = _default_backup_destination()
-    summary_lines.append(f"destination={destination}")
-
-    if destination in ("cloud", "both"):
-        cb = SETTINGS["cloud_backup"]
-        key = cloud_backup_object_key(backup_name)
-        print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
+    ok, msg = verify_backup_integrity(backup_path)
+    if not ok:
+        print(f"ERROR: Backup integrity check failed: {msg}")
+        summary_lines.append(f"integrity_check=failed ({msg})")
+        result = False
+        corrupt_path = backup_path.with_name(backup_path.name + ".corrupt")
         try:
-            s3_put_file(cb, backup_path, key)
-            print("Cloud upload complete.")
-            summary_lines.append("cloud_upload=ok")
-            if destination == "cloud":
-                try:
-                    backup_path.unlink()
-                    print("Local copy removed (Cloud only).")
-                except Exception as e:
-                    print(f"WARNING: Failed to remove local copy: {e}")
+            backup_path.rename(corrupt_path)
+            print(f"Renamed for diagnosis: {corrupt_path}")
         except Exception as e:
-            print(f"WARNING: Cloud upload failed: {e}")
-            summary_lines.append(f"cloud_upload=failed ({e})")
-            result = False
-            if destination == "cloud":
-                print("Keeping local copy since the cloud upload failed.")
+            print(f"WARNING: Failed to rename corrupt backup: {e}")
+    else:
+        print("Integrity check passed.")
+        summary_lines.append("integrity_check=ok")
 
-    print("\nApplying backup retention policy in /root/backup ...")
-    kept, deleted = apply_backup_retention(BACKUP_DIR)
-    print(f"Retention done. Kept: {len(kept)}  Deleted: {len(deleted)}")
-    summary_lines.append(f"local_retention kept={len(kept)} deleted={len(deleted)}")
+    if result:
+        if destination_override is not None:
+            destination = destination_override
+        elif interactive:
+            destination = prompt_backup_destination()
+        else:
+            destination = _default_backup_destination()
+        summary_lines.append(f"destination={destination}")
+
+        if destination in ("cloud", "both"):
+            cb = SETTINGS["cloud_backup"]
+            key = cloud_backup_object_key(backup_name)
+            print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
+            try:
+                s3_put_file(cb, backup_path, key)
+                print("Cloud upload complete.")
+                summary_lines.append("cloud_upload=ok")
+                if destination == "cloud":
+                    try:
+                        backup_path.unlink()
+                        print("Local copy removed (Cloud only).")
+                    except Exception as e:
+                        print(f"WARNING: Failed to remove local copy: {e}")
+            except Exception as e:
+                print(f"WARNING: Cloud upload failed: {e}")
+                summary_lines.append(f"cloud_upload=failed ({e})")
+                result = False
+                if destination == "cloud":
+                    print("Keeping local copy since the cloud upload failed.")
+
+        print("\nApplying backup retention policy in /root/backup ...")
+        kept, deleted = apply_backup_retention(BACKUP_DIR)
+        print(f"Retention done. Kept: {len(kept)}  Deleted: {len(deleted)}")
+        summary_lines.append(f"local_retention kept={len(kept)} deleted={len(deleted)}")
 
     if interactive:
         cleanup_baks = input("\nCleanup all docker-compose .bak files in /root now? (Y/N) [default: N]: ").strip().lower()
