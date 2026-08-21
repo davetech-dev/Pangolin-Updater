@@ -113,6 +113,8 @@ DEFAULT_SETTINGS = {
         "prefix": "",
         "use_path_style": True,
         "verify_ssl": True,
+        "encrypt_cloud_backups": False,
+        "encryption_passphrase": "",
     },
 }
 
@@ -175,6 +177,10 @@ def refresh_paths():
 
 refresh_paths()
 BACKUP_RE = re.compile(r"^pangolin-backup-(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.tar\.gz$")
+# Cloud-only: backups encrypted before upload (see encrypt_backup_file) carry
+# this suffix. Local backups are never encrypted, so list_backups() never
+# needs to match it.
+BACKUP_ENCRYPTED_RE = re.compile(r"^pangolin-backup-(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.tar\.gz\.enc$")
 
 @dataclass(frozen=True)
 class BackupFile:
@@ -587,6 +593,95 @@ def cloud_backup_configured():
 
 def cloud_backup_ready():
     return bool(SETTINGS["cloud_backup"].get("enabled")) and cloud_backup_configured()
+
+# --- Cloud backup encryption: OpenSSL AES-256-CBC, encrypt-then-MAC ---
+#
+# openssl enc's own AEAD (GCM) support is version-inconsistent and fiddly to
+# script reliably, so encryption uses the long-established CBC+PBKDF2+salt
+# pattern, paired with an HMAC-SHA256 integrity/authentication layer built
+# from hashlib/hmac (already used by the S3 SigV4 client above) — a standard
+# encrypt-then-MAC construction. This lets decrypt fail fast and cleanly on
+# a wrong passphrase or corrupted file instead of silently producing garbage.
+
+def _derive_hmac_key(passphrase: str) -> bytes:
+    # Separate, fixed-salt derivation purely for the integrity tag — the
+    # actual secrecy of the ciphertext comes from openssl's own per-file
+    # random salt (-salt), not from this key.
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), b"pangolin-updater-hmac", 100_000)
+
+def encrypt_backup_file(src_path: Path, passphrase: str) -> Path:
+    """
+    Encrypts src_path via openssl, then appends a 32-byte HMAC-SHA256
+    trailer over the ciphertext. Output: src_path with '.enc' appended.
+    Does not modify or delete src_path. Raises RuntimeError on failure.
+    """
+    dest_path = src_path.with_name(src_path.name + ".enc")
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "100000", "-salt",
+         "-pass", "fd:0", "-in", str(src_path), "-out", str(dest_path)],
+        input=passphrase.encode("utf-8"),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"openssl encryption failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+
+    hmac_key = _derive_hmac_key(passphrase)
+    h = hmac.new(hmac_key, digestmod=hashlib.sha256)
+    with open(dest_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    with open(dest_path, "ab") as f:
+        f.write(h.digest())
+
+    return dest_path
+
+def decrypt_backup_file(src_path: Path, passphrase: str, dest_path: Path) -> None:
+    """
+    Inverse of encrypt_backup_file(). Streams src_path, splitting off the
+    trailing 32-byte HMAC tag and verifying it BEFORE attempting openssl
+    decryption, so a wrong passphrase or corrupted file fails cleanly rather
+    than producing silent garbage output. Raises RuntimeError on either an
+    HMAC mismatch or an openssl failure.
+    """
+    size = src_path.stat().st_size
+    if size < 32:
+        raise RuntimeError("encrypted file is too small to contain a valid HMAC tag")
+    ciphertext_size = size - 32
+
+    hmac_key = _derive_hmac_key(passphrase)
+    h = hmac.new(hmac_key, digestmod=hashlib.sha256)
+    tmp_ciphertext = src_path.with_name(src_path.name + ".ciphertext_tmp")
+    try:
+        with open(src_path, "rb") as fin, open(tmp_ciphertext, "wb") as fout:
+            remaining = ciphertext_size
+            while remaining > 0:
+                chunk = fin.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                fout.write(chunk)
+                remaining -= len(chunk)
+            tag = fin.read(32)
+
+        if not hmac.compare_digest(tag, h.digest()):
+            raise RuntimeError("integrity check failed: wrong passphrase or corrupted file")
+
+        proc = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "100000",
+             "-pass", "fd:0", "-in", str(tmp_ciphertext), "-out", str(dest_path)],
+            input=passphrase.encode("utf-8"),
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"openssl decryption failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    finally:
+        try:
+            tmp_ciphertext.unlink()
+        except Exception:
+            pass
 
 def _sha256_file(path, chunk_size=1024 * 1024):
     h = hashlib.sha256()
@@ -1104,26 +1199,58 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
 
         if destination in ("cloud", "both"):
             cb = SETTINGS["cloud_backup"]
-            key = cloud_backup_object_key(backup_name)
-            cloud_upload_ok = False
-            print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
-            try:
-                s3_put_file(cb, backup_path, key)
-                print("Cloud upload complete.")
-                summary_lines.append("cloud_upload=ok")
-                cloud_upload_ok = True
-                if destination == "cloud":
+            upload_path = backup_path
+            upload_key_suffix = ""
+            encrypted_tmp = None
+            encryption_ok = True
+
+            if cb.get("encrypt_cloud_backups"):
+                passphrase = cb.get("encryption_passphrase") or ""
+                if not passphrase:
+                    print("WARNING: Cloud encryption is enabled but no passphrase is configured. Skipping upload.")
+                    summary_lines.append("cloud_upload=skipped (no encryption passphrase)")
+                    result = False
+                    encryption_ok = False
+                else:
                     try:
-                        backup_path.unlink()
-                        print("Local copy removed (Cloud only).")
+                        print("\nEncrypting backup for cloud upload...")
+                        encrypted_tmp = encrypt_backup_file(backup_path, passphrase)
+                        upload_path = encrypted_tmp
+                        upload_key_suffix = ".enc"
+                        print("Encryption complete.")
                     except Exception as e:
-                        print(f"WARNING: Failed to remove local copy: {e}")
-            except Exception as e:
-                print(f"WARNING: Cloud upload failed: {e}")
-                summary_lines.append(f"cloud_upload=failed ({e})")
-                result = False
-                if destination == "cloud":
-                    print("Keeping local copy since the cloud upload failed.")
+                        print(f"ERROR: Encryption failed: {e}")
+                        summary_lines.append(f"encryption=failed ({e})")
+                        result = False
+                        encryption_ok = False
+
+            key = cloud_backup_object_key(backup_name) + upload_key_suffix
+            cloud_upload_ok = False
+            if encryption_ok:
+                print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
+                try:
+                    s3_put_file(cb, upload_path, key)
+                    print("Cloud upload complete.")
+                    summary_lines.append("cloud_upload=ok")
+                    cloud_upload_ok = True
+                    if destination == "cloud":
+                        try:
+                            backup_path.unlink()
+                            print("Local copy removed (Cloud only).")
+                        except Exception as e:
+                            print(f"WARNING: Failed to remove local copy: {e}")
+                except Exception as e:
+                    print(f"WARNING: Cloud upload failed: {e}")
+                    summary_lines.append(f"cloud_upload=failed ({e})")
+                    result = False
+                    if destination == "cloud":
+                        print("Keeping local copy since the cloud upload failed.")
+
+            if encrypted_tmp is not None and encrypted_tmp.exists():
+                try:
+                    encrypted_tmp.unlink()
+                except Exception as e:
+                    print(f"WARNING: Failed to remove temporary encrypted file: {e}")
 
             if cloud_upload_ok:
                 prefix = (cb.get("prefix") or "").strip("/")
@@ -1308,13 +1435,16 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
 def list_cloud_backups(cfg: dict, prefix: str = "") -> list[tuple[str, datetime]]:
     """
     Mirrors list_backups(): lists cloud objects under prefix, filters by
-    BACKUP_RE against the basename, returns [(full_object_key, dt), ...].
+    BACKUP_ENCRYPTED_RE (tried first) or plain BACKUP_RE against the
+    basename, returns [(full_object_key, dt), ...]. Matching both patterns
+    means turning encryption on/off doesn't orphan already-uploaded objects
+    from retention/restore.
     """
     objects = s3_list_objects(cfg, prefix=prefix)
     items = []
     for obj in objects:
         name = obj["key"].rsplit("/", 1)[-1]
-        m = BACKUP_RE.match(name)
+        m = BACKUP_ENCRYPTED_RE.match(name) or BACKUP_RE.match(name)
         if not m:
             continue
         dt = datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S")
@@ -1479,7 +1609,7 @@ def do_restore():
         candidates = []
         for obj in objects:
             name = obj["key"].rsplit("/", 1)[-1]
-            if BACKUP_RE.match(name):
+            if BACKUP_ENCRYPTED_RE.match(name) or BACKUP_RE.match(name):
                 candidates.append((obj, name))
         if not candidates:
             print(f"\nNo backups found in cloud storage (bucket: {cb['bucket']}, prefix: {prefix or '(root)'}).")
@@ -1512,6 +1642,26 @@ def do_restore():
                 downloaded_tmp.unlink()
             return
         print("Download complete.")
+
+        if name.endswith(".enc"):
+            cb_passphrase = cb.get("encryption_passphrase") or ""
+            if not cb_passphrase:
+                cb_passphrase = getpass.getpass("Enter the encryption passphrase for this backup: ")
+            plain_name = name[:-4]  # strip '.enc'
+            decrypted_path = cloud_download_dir / plain_name
+            print("Decrypting...")
+            try:
+                decrypt_backup_file(downloaded_tmp, cb_passphrase, decrypted_path)
+            except Exception as e:
+                print(f"Failed to decrypt backup: {e}")
+                if downloaded_tmp.exists():
+                    downloaded_tmp.unlink()
+                return
+            downloaded_tmp.unlink()  # remove the encrypted intermediate
+            downloaded_tmp = decrypted_path
+            name = plain_name
+            print("Decryption complete.")
+
         m = BACKUP_RE.match(name)
         selected = BackupFile(path=downloaded_tmp, dt=datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S"))
     else:
@@ -1807,11 +1957,13 @@ def do_settings_cloud_backup():
         print(f"[7]  Path Prefix             (current: {cb.get('prefix') or '(bucket root)'})")
         print(f"[8]  Path-style addressing   (current: {'Yes' if cb.get('use_path_style', True) else 'No'})")
         print(f"[9]  Verify SSL certificate  (current: {'Yes' if cb.get('verify_ssl', True) else 'No'})")
-        print("[10] Test Connection")
-        print("[11] Back to Settings")
+        print(f"[10] Encrypt cloud backups   (current: {'Enabled' if cb.get('encrypt_cloud_backups') else 'Disabled'})")
+        print(f"[11] Encryption Passphrase   (current: {'set' if cb.get('encryption_passphrase') else 'not set'})")
+        print("[12] Test Connection")
+        print("[13] Back to Settings")
         if not cloud_backup_configured():
             print("\nNote: Endpoint, Bucket, Access Key, and Secret Key are all required before enabling.")
-        choice = input("Select an option [1-11]: ").strip()
+        choice = input("Select an option [1-13]: ").strip()
 
         if choice == "1":
             settings_cloud_backup_toggle()
@@ -1841,9 +1993,15 @@ def do_settings_cloud_backup():
             settings_cloud_toggle_field("verify_ssl", "Verify SSL certificate (disable only for self-signed MinIO)")
             pause()
         elif choice == "10":
-            settings_cloud_test_connection()
+            settings_cloud_toggle_field("encrypt_cloud_backups", "Encrypt cloud backups (requires openssl on this system)")
             pause()
         elif choice == "11":
+            settings_cloud_field("encryption_passphrase", "Encryption Passphrase", secret=True)
+            pause()
+        elif choice == "12":
+            settings_cloud_test_connection()
+            pause()
+        elif choice == "13":
             return
         else:
             print("Invalid option.")
