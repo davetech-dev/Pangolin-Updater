@@ -796,30 +796,32 @@ def do_update():
 
     # Apply updates
     new_text = compose_text
-    applied_changes = 0
+    changed_services = []
     for key, meta in IMAGES.items():
         old = current.get(key)
         new = selections.get(key)
         if old != new and new is not None:
             try:
                 new_text = update_image_tag(new_text, meta["image_repo"], new)
-                applied_changes += 1
+                changed_services.append(key)
             except RuntimeError as e:
                 print(f"Warning: {e} — skipping {meta['display']}.")
 
-    if applied_changes == 0:
+    if not changed_services:
         print("\nNo updates could be applied to docker-compose.yml. Skipping restart.")
         return
 
     write_compose_text(new_text)
 
-    # Restart stack
-    rc = run(["docker", "compose", "down"], cwd=ROOT_DIR)
+    # Only pull + recreate the services that actually changed, leaving the
+    # rest of the stack running undisturbed.
+    print(f"\nRestarting only: {', '.join(changed_services)}")
+    rc = run(["docker", "compose", "pull"] + changed_services, cwd=ROOT_DIR)
     if rc != 0:
-        print("docker compose down failed; aborting.")
+        print("docker compose pull failed; aborting.")
         sys.exit(rc)
 
-    rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
+    rc = run(["docker", "compose", "up", "-d"] + changed_services, cwd=ROOT_DIR)
     if rc != 0:
         print("docker compose up -d failed.")
         sys.exit(rc)

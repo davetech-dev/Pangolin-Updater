@@ -31,9 +31,9 @@ It is designed for environments where:
   - Release page links shown inline
   - Pangolin includes a callout recommending upgrade-by-upgrade rollout with backup/testing at each step
 5. Shows planned changes and exits early if everything is unchanged
-6. On confirmation, writes compose update (with a timestamped `.bak` safety copy), then runs:
-  - `docker compose down`
-  - `docker compose up -d`
+6. On confirmation, writes compose update (with a timestamped `.bak` safety copy), then only pulls and recreates the services that actually changed (leaving the rest of the stack running):
+  - `docker compose pull <changed services>`
+  - `docker compose up -d <changed services>`
 7. Optionally prunes unused Docker images
 
 ### 3) Restore
