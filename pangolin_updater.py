@@ -483,6 +483,22 @@ def select_release_tag(meta, current_tag):
         return current_tag
     return val
 
+# Pangolin maintains its own rolling SQLite snapshots under config/db/backups/;
+# only the live db.sqlite is needed to restore current state, so the snapshot
+# history (and any stray .bak.* copies) is excluded to keep archives small.
+BACKUP_EXCLUDE_DIRS = {"config/db/backups"}
+BACKUP_EXCLUDE_FILE_RE = re.compile(r"\.bak(\.|$)")
+
+def _backup_tar_filter(tarinfo):
+    name = tarinfo.name
+    if name in BACKUP_EXCLUDE_DIRS or any(
+        name.startswith(f"{d}/") for d in BACKUP_EXCLUDE_DIRS
+    ):
+        return None
+    if BACKUP_EXCLUDE_FILE_RE.search(Path(name).name):
+        return None
+    return tarinfo
+
 def do_backup(render: bool = True):
     if render:
         render_screen("Backup")
@@ -493,9 +509,9 @@ def do_backup(render: bool = True):
     backup_name = f"pangolin-backup-{ts}.tar.gz"
     backup_path = BACKUP_DIR / backup_name
 
-    with tarfile.open(backup_path, "w:gz") as tar:
+    with tarfile.open(backup_path, "w:gz", compresslevel=6) as tar:
         tar.add(str(COMPOSE_FILE), arcname="docker-compose.yml")
-        tar.add(str(CONFIG_DIR), arcname="config")
+        tar.add(str(CONFIG_DIR), arcname="config", filter=_backup_tar_filter)
 
     print(f"\nBackup created: {backup_path}")
     print("\nApplying backup retention policy in /root/backup ...")
