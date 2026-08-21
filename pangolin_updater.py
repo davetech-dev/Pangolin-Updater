@@ -24,7 +24,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 __app_name__ = "pangolin-updater"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
