@@ -308,6 +308,8 @@ def handle_cli_flags():
   updater --version    Show version
   updater --update      Install the latest version from GitHub
   updater --update --force  Reinstall even if already up to date
+  updater --backup      Run a backup non-interactively (for cron)
+  updater --backup --destination=local|cloud|both  Override the backup destination
   updater --help       Show help
 """)
         sys.exit(0)
@@ -315,6 +317,18 @@ def handle_cli_flags():
     if sys.argv[1] == "--update":
         do_self_update()
         sys.exit(0)
+
+    if sys.argv[1] == "--backup":
+        require_root()
+        destination_override = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--destination="):
+                destination_override = arg.split("=", 1)[1]
+        if destination_override is not None and destination_override not in ("local", "cloud", "both"):
+            print(f"ERROR: Invalid --destination value '{destination_override}'. Must be local, cloud, or both.")
+            sys.exit(2)
+        ok = do_backup(render=False, interactive=False, destination_override=destination_override)
+        sys.exit(0 if ok else 1)
 
 _stdout_lock = threading.Lock()
 
