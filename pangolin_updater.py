@@ -347,6 +347,10 @@ def handle_cli_flags():
         ok = do_backup(render=False, interactive=False, destination_override=destination_override)
         sys.exit(0 if ok else 1)
 
+    print(f"Unrecognized argument: {sys.argv[1]}")
+    print("Run 'updater --help' to see available commands.")
+    sys.exit(2)
+
 _stdout_lock = threading.Lock()
 
 def run(cmd, cwd=ROOT_DIR, label=None):
