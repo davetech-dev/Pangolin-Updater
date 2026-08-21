@@ -895,30 +895,32 @@ def notifications_configured() -> bool:
 def notifications_ready() -> bool:
     return bool(SETTINGS["notifications"].get("enabled")) and notifications_configured()
 
-def _send_notification_payload(n: dict, success: bool, summary: str, timeout: float = 10):
+def _send_notification_payload(n: dict, success: bool, summary: str, event_label: str = "Backup", timeout: float = 10):
     kind = n["type"]
     status_word = "succeeded" if success else "failed"
     icon = "✅" if success else "❌"
+    title = f"{icon} Pangolin {event_label} {status_word}"
 
     if kind == "discord":
         url = n["webhook_url"]
-        body = json.dumps({"content": f"{icon} Pangolin backup {status_word}\n{summary}"}).encode("utf-8")
+        body = json.dumps({"content": f"{title}\n{summary}"}).encode("utf-8")
         headers = {"Content-Type": "application/json"}
     elif kind == "slack":
         url = n["webhook_url"]
-        body = json.dumps({"text": f"{icon} Pangolin backup {status_word}\n{summary}"}).encode("utf-8")
+        body = json.dumps({"text": f"{title}\n{summary}"}).encode("utf-8")
         headers = {"Content-Type": "application/json"}
     elif kind == "ntfy":
         url = n["ntfy_topic_url"]
         body = summary.encode("utf-8")
         headers = {
-            "Title": f"Pangolin Backup {status_word.capitalize()}",
+            "Title": f"Pangolin {event_label} {status_word.capitalize()}",
             "Priority": "default" if success else "high",
             "Tags": "white_check_mark" if success else "x",
         }
     else:  # generic
         url = n["webhook_url"]
         body = json.dumps({
+            "event": event_label.lower(),
             "success": success,
             "summary": summary,
             "host": socket.gethostname(),
@@ -935,10 +937,12 @@ def _send_notification_payload(n: dict, success: bool, summary: str, timeout: fl
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         resp.read()
 
-def send_backup_notification(success: bool, summary: str) -> None:
+def send_notification(success: bool, summary: str, event_label: str = "Backup") -> None:
     """
-    Best-effort only: never raises, never affects do_backup()'s return value.
-    Prints a WARNING on failure rather than propagating.
+    Best-effort only: never raises, never affects the caller's own return
+    value. Prints a WARNING on failure rather than propagating. event_label
+    ("Backup" or "Update") only affects the message text/title — provider,
+    URL, and the notify_on_success/failure gates are shared.
     """
     if not notifications_ready():
         return
@@ -948,7 +952,7 @@ def send_backup_notification(success: bool, summary: str) -> None:
     if not success and not n.get("notify_on_failure", True):
         return
     try:
-        _send_notification_payload(n, success, summary)
+        _send_notification_payload(n, success, summary, event_label=event_label)
     except Exception as e:
         print(f"WARNING: Failed to send notification: {e}")
 
@@ -1357,7 +1361,7 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
             print(f"Removed compose backups: {removed}")
 
     summary = f"host={socket.gethostname()} " + " ".join(summary_lines)
-    send_backup_notification(result, summary)
+    send_notification(result, summary, event_label="Backup")
 
     return result
 
@@ -1629,9 +1633,11 @@ def do_update():
 
     if not changed_services:
         print("\nNo updates could be applied to docker-compose.yml. Skipping restart.")
+        send_notification(False, f"host={socket.gethostname()} no updates could be applied to docker-compose.yml", event_label="Update")
         return
 
     write_compose_text(new_text)
+    changes_summary = ", ".join(f"{key}={selections[key]}" for key in changed_services)
 
     # Only pull + recreate the services that actually changed, leaving the
     # rest of the stack running undisturbed.
@@ -1639,11 +1645,13 @@ def do_update():
     rc = run(["docker", "compose", "pull"] + changed_services, cwd=ROOT_DIR)
     if rc != 0:
         print("docker compose pull failed; aborting.")
+        send_notification(False, f"host={socket.gethostname()} docker compose pull failed for: {changes_summary}", event_label="Update")
         sys.exit(rc)
 
     rc = run(["docker", "compose", "up", "-d"] + changed_services, cwd=ROOT_DIR)
     if rc != 0:
         print("docker compose up -d failed.")
+        send_notification(False, f"host={socket.gethostname()} docker compose up -d failed for: {changes_summary}", event_label="Update")
         sys.exit(rc)
 
     print("\nUpdate complete.")
@@ -1663,6 +1671,8 @@ def do_update():
             print("Warning: docker image prune -a failed (continuing).")
         else:
             print("Unused images removed.")
+
+    send_notification(True, f"host={socket.gethostname()} updated: {changes_summary}", event_label="Update")
 
 def prompt_restore_source():
     ready = cloud_backup_ready()
@@ -2098,7 +2108,7 @@ def settings_notifications_test():
         return
     print("\nSending a test notification...")
     try:
-        _send_notification_payload(SETTINGS["notifications"], True, "Test notification from pangolin-updater Settings.")
+        _send_notification_payload(SETTINGS["notifications"], True, "Test notification from pangolin-updater Settings.", event_label="Test")
         print("Success: notification sent.")
     except Exception as e:
         print(f"Failed: {e}")
