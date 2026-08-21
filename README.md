@@ -116,6 +116,15 @@ Or every 6 hours:
 0 */6 * * * /usr/local/bin/updater --backup >> /var/log/pangolin-backup.log 2>&1
 ```
 
+### Backup verification
+```bash
+updater --verify-backup
+```
+Confirms the latest backup is actually restorable — downloads it (decrypting first if needed) and runs the same integrity check `--backup` runs right after creating an archive, but **never touches the live stack**: no `docker compose down`/`up`, no file swaps. Verifies the latest local backup by default, falling back to the latest cloud backup if no local backups exist; override with `--source=local` or `--source=cloud`. Exits `0` if the backup verified cleanly, non-zero otherwise, and sends a webhook notification if one is configured — good for a periodic sanity check that your disaster-recovery backups actually work, not just that they exist:
+```cron
+0 4 * * 0 /usr/local/bin/updater --verify-backup >> /var/log/pangolin-verify.log 2>&1
+```
+
 ---
 
 ## Installation

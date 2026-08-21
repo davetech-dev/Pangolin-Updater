@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import tarfile
+import tempfile
 import shutil
 import subprocess
 import threading
@@ -327,6 +328,8 @@ def handle_cli_flags():
   updater --update --force  Reinstall even if already up to date
   updater --backup      Run a backup non-interactively (for cron)
   updater --backup --destination=local|cloud|both  Override the backup destination
+  updater --verify-backup  Verify the latest backup is restorable, without touching the live stack
+  updater --verify-backup --source=local|cloud  Override which backup to verify
   updater --help       Show help
 """)
         sys.exit(0)
@@ -345,6 +348,18 @@ def handle_cli_flags():
             print(f"ERROR: Invalid --destination value '{destination_override}'. Must be local, cloud, or both.")
             sys.exit(2)
         ok = do_backup(render=False, interactive=False, destination_override=destination_override)
+        sys.exit(0 if ok else 1)
+
+    if sys.argv[1] == "--verify-backup":
+        require_root()
+        source_override = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--source="):
+                source_override = arg.split("=", 1)[1]
+        if source_override is not None and source_override not in ("local", "cloud"):
+            print(f"ERROR: Invalid --source value '{source_override}'. Must be local or cloud.")
+            sys.exit(2)
+        ok = do_verify_backup(source_override=source_override)
         sys.exit(0 if ok else 1)
 
     print(f"Unrecognized argument: {sys.argv[1]}")
@@ -1690,6 +1705,33 @@ def prompt_restore_source():
         return "cloud"
     return "local"
 
+def _download_and_decrypt_cloud_backup(cb: dict, key: str, name: str, dest_dir: Path) -> tuple[Path, str]:
+    """
+    Downloads a cloud backup object into dest_dir, decrypting it first if
+    it's a .enc object (using the configured passphrase, prompting if none
+    is set). Returns (plaintext_path, plaintext_name). Raises on failure —
+    caller is responsible for cleaning up any partial download. Shared by
+    do_restore()'s cloud branch and do_verify_backup().
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = dest_dir / name
+    s3_get_object_to_file(cb, key, downloaded)
+    print("Download complete.")
+
+    if not name.endswith(".enc"):
+        return downloaded, name
+
+    passphrase = cb.get("encryption_passphrase") or ""
+    if not passphrase:
+        passphrase = getpass.getpass("Enter the encryption passphrase for this backup: ")
+    plain_name = name[:-4]  # strip '.enc'
+    decrypted_path = dest_dir / plain_name
+    print("Decrypting...")
+    decrypt_backup_file(downloaded, passphrase, decrypted_path)
+    downloaded.unlink()  # remove the encrypted intermediate
+    print("Decryption complete.")
+    return decrypted_path, plain_name
+
 def do_restore():
     render_screen("Restore")
     source = prompt_restore_source()
@@ -1703,6 +1745,7 @@ def do_restore():
             objects = s3_list_objects(cb, prefix=prefix)
         except Exception as e:
             print(f"Failed to list cloud backups: {e}")
+            send_notification(False, f"host={socket.gethostname()} failed to list cloud backups: {e}", event_label="Restore")
             return
 
         candidates = []
@@ -1730,36 +1773,21 @@ def do_restore():
 
         obj, name = candidates[int(choice) - 1]
         cloud_download_dir = BACKUP_DIR / ".cloud_downloads"
-        cloud_download_dir.mkdir(parents=True, exist_ok=True)
-        downloaded_tmp = cloud_download_dir / name
         print(f"\nDownloading {name} from cloud storage...")
         try:
-            s3_get_object_to_file(cb, obj["key"], downloaded_tmp)
+            downloaded_tmp, name = _download_and_decrypt_cloud_backup(cb, obj["key"], name, cloud_download_dir)
         except Exception as e:
-            print(f"Failed to download backup: {e}")
-            if downloaded_tmp.exists():
-                downloaded_tmp.unlink()
+            print(f"Failed to download/prepare backup: {e}")
+            send_notification(False, f"host={socket.gethostname()} failed to download/prepare cloud backup {name}: {e}", event_label="Restore")
+            for leftover_name in (name, name[:-4] if name.endswith(".enc") else None):
+                if leftover_name:
+                    leftover = cloud_download_dir / leftover_name
+                    if leftover.exists():
+                        try:
+                            leftover.unlink()
+                        except Exception:
+                            pass
             return
-        print("Download complete.")
-
-        if name.endswith(".enc"):
-            cb_passphrase = cb.get("encryption_passphrase") or ""
-            if not cb_passphrase:
-                cb_passphrase = getpass.getpass("Enter the encryption passphrase for this backup: ")
-            plain_name = name[:-4]  # strip '.enc'
-            decrypted_path = cloud_download_dir / plain_name
-            print("Decrypting...")
-            try:
-                decrypt_backup_file(downloaded_tmp, cb_passphrase, decrypted_path)
-            except Exception as e:
-                print(f"Failed to decrypt backup: {e}")
-                if downloaded_tmp.exists():
-                    downloaded_tmp.unlink()
-                return
-            downloaded_tmp.unlink()  # remove the encrypted intermediate
-            downloaded_tmp = decrypted_path
-            name = plain_name
-            print("Decryption complete.")
 
         m = BACKUP_RE.match(name)
         selected = BackupFile(path=downloaded_tmp, dt=datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S"))
@@ -1811,9 +1839,11 @@ def do_restore():
 
         if not extracted_compose.exists():
             print("ERROR: Backup does not contain docker-compose.yml. Aborting.")
+            send_notification(False, f"host={socket.gethostname()} backup {selected.path.name} is missing docker-compose.yml", event_label="Restore")
             return
         if not extracted_config.exists() or not extracted_config.is_dir():
             print("ERROR: Backup does not contain a config/ directory. Aborting.")
+            send_notification(False, f"host={socket.gethostname()} backup {selected.path.name} is missing config/", event_label="Restore")
             return
 
         # Preflight succeeded; now stop the stack and perform restore.
@@ -1864,7 +1894,7 @@ def do_restore():
 
         print(f"Restored: {CONFIG_DIR}")
 
-    except BaseException:
+    except BaseException as e:
         if compose_replaced and not compose_rolled_back and compose_bak.exists():
             try:
                 shutil.copy2(compose_bak, COMPOSE_FILE)
@@ -1878,6 +1908,7 @@ def do_restore():
             up_rc = run(["docker", "compose", "up", "-d"], cwd=ROOT_DIR)
             if up_rc != 0:
                 print("WARNING: Failed to restart stack automatically after restore failure.")
+        send_notification(False, f"host={socket.gethostname()} restore of {selected.path.name} failed: {e}", event_label="Restore")
         raise
 
     finally:
@@ -1924,6 +1955,7 @@ def do_restore():
         if retry_rc != 0:
             print("WARNING: Failed to restart stack after rollback attempt.")
 
+        send_notification(False, f"host={socket.gethostname()} restore of {selected.path.name}: docker compose up -d failed after restore, rollback attempted", event_label="Restore")
         sys.exit(rc)
 
     # Startup succeeded, cleanup staged backups.
@@ -1940,6 +1972,77 @@ def do_restore():
             print(f"\nWARNING: Failed to remove staged compose backup {compose_bak}: {e}")
 
     print("\nRestore complete. Stack restarted.")
+    send_notification(True, f"host={socket.gethostname()} restored from {selected.path.name}", event_label="Restore")
+
+
+def do_verify_backup(source_override: str | None = None) -> bool:
+    """
+    Verifies the latest backup is structurally sound and restorable, WITHOUT
+    touching the live Pangolin stack (no docker compose down/up, no file
+    swaps) — this is verify_backup_integrity() run against whichever backup
+    would actually be used in a real restore right now. Local by default;
+    falls back to cloud if no local backups exist, or with source_override.
+    Intended for periodic unattended checks (see --verify-backup), so it
+    never prompts except for a missing encryption passphrase.
+    """
+    local_backups = list_backups(BACKUP_DIR)
+    source = source_override
+    if source is None:
+        source = "local" if local_backups else ("cloud" if cloud_backup_ready() else None)
+
+    if source is None:
+        print("No backups found locally, and Cloud Backup isn't configured.")
+        return False
+
+    if source == "local":
+        if not local_backups:
+            print(f"No local backups found in {BACKUP_DIR}.")
+            return False
+        latest = max(local_backups, key=lambda b: b.dt)
+        print(f"Verifying latest local backup: {latest.path.name}")
+        ok, msg = verify_backup_integrity(latest.path)
+        target_desc = latest.path.name
+
+    elif source == "cloud":
+        if not cloud_backup_ready():
+            print("Cloud Backup isn't configured.")
+            return False
+        cb = SETTINGS["cloud_backup"]
+        prefix = (cb.get("prefix") or "").strip("/")
+        cloud_backups = list_cloud_backups(cb, prefix=prefix)
+        if not cloud_backups:
+            print(f"No cloud backups found (bucket: {cb['bucket']}, prefix: {prefix or '(root)'}).")
+            return False
+        latest_key, _dt = max(cloud_backups, key=lambda item: item[1])
+        name = latest_key.rsplit("/", 1)[-1]
+        target_desc = name.removesuffix(".enc")
+        print(f"Verifying latest cloud backup: {name}")
+
+        scratch_dir = Path(tempfile.mkdtemp(prefix="pangolin-verify-"))
+        try:
+            try:
+                downloaded, plain_name = _download_and_decrypt_cloud_backup(cb, latest_key, name, scratch_dir)
+            except Exception as e:
+                print(f"ERROR: Failed to download/prepare backup: {e}")
+                send_notification(False, f"host={socket.gethostname()} verify failed: could not fetch cloud backup {name}: {e}", event_label="Verify")
+                return False
+            ok, msg = verify_backup_integrity(downloaded)
+            target_desc = plain_name
+        finally:
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    else:
+        print(f"ERROR: Invalid source '{source}'. Must be local or cloud.")
+        return False
+
+    if ok:
+        print(f"Verification PASSED: {target_desc}")
+    else:
+        print(f"Verification FAILED: {target_desc}: {msg}")
+
+    summary = f"host={socket.gethostname()} source={source} backup={target_desc} " + ("verification passed" if ok else f"verification FAILED: {msg}")
+    send_notification(ok, summary, event_label="Verify")
+    return ok
 
 
 def settings_edition_select():
