@@ -1105,11 +1105,13 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
         if destination in ("cloud", "both"):
             cb = SETTINGS["cloud_backup"]
             key = cloud_backup_object_key(backup_name)
+            cloud_upload_ok = False
             print(f"\nUploading to cloud storage (s3://{cb['bucket']}/{key})...")
             try:
                 s3_put_file(cb, backup_path, key)
                 print("Cloud upload complete.")
                 summary_lines.append("cloud_upload=ok")
+                cloud_upload_ok = True
                 if destination == "cloud":
                     try:
                         backup_path.unlink()
@@ -1122,6 +1124,13 @@ def do_backup(render: bool = True, interactive: bool = True, destination_overrid
                 result = False
                 if destination == "cloud":
                     print("Keeping local copy since the cloud upload failed.")
+
+            if cloud_upload_ok:
+                prefix = (cb.get("prefix") or "").strip("/")
+                print("\nApplying cloud backup retention policy...")
+                kept_c, deleted_c = apply_cloud_backup_retention(cb, prefix=prefix)
+                print(f"Cloud retention done. Kept: {len(kept_c)}  Deleted: {len(deleted_c)}")
+                summary_lines.append(f"cloud_retention kept={len(kept_c)} deleted={len(deleted_c)}")
 
         print("\nApplying backup retention policy in /root/backup ...")
         kept, deleted = apply_backup_retention(BACKUP_DIR)
@@ -1189,49 +1198,52 @@ def list_backups(backup_dir: Path) -> list[BackupFile]:
     items.sort(key=lambda b: b.dt)  # oldest -> newest
     return items
 
-def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_run: bool = False) -> tuple[list[Path], list[Path]]:
+def _select_retained(items, now: datetime | None = None) -> set:
     """
-    Returns (kept_paths, deleted_paths)
+    Pure day/3-day/2-week/month keep-decision, no I/O. `items` is a list of
+    (identifier, dt) pairs — identifier can be anything hashable (a local
+    Path, or an S3 object key string). Returns the set of identifiers to
+    keep; shared by local (apply_backup_retention) and cloud
+    (apply_cloud_backup_retention) retention so the policy only lives once.
     """
     if now is None:
         now = datetime.now()
 
-    backups = list_backups(backup_dir)
-    if not backups:
-        return ([], [])
+    if not items:
+        return set()
 
     # Group by day/week/month
     by_day = defaultdict(list)
     by_week = defaultdict(list)   # (iso_year, iso_week)
     by_month = defaultdict(list)  # (year, month)
 
-    for b in backups:
-        day_key = b.dt.date()
-        iso_year, iso_week, _ = b.dt.isocalendar()
+    for identifier, dt in items:
+        day_key = dt.date()
+        iso_year, iso_week, _ = dt.isocalendar()
         week_key = (iso_year, iso_week)
-        month_key = (b.dt.year, b.dt.month)
+        month_key = (dt.year, dt.month)
 
-        by_day[day_key].append(b)
-        by_week[week_key].append(b)
-        by_month[month_key].append(b)
+        by_day[day_key].append((identifier, dt))
+        by_week[week_key].append((identifier, dt))
+        by_month[month_key].append((identifier, dt))
 
     # Helper: latest in group
-    def latest(group: list[BackupFile]) -> BackupFile:
-        return max(group, key=lambda x: x.dt)
+    def latest(group):
+        return max(group, key=lambda x: x[1])[0]
 
     keep = set()
 
     today = now.date()
 
     # 1) Keep ALL from today
-    for b in by_day.get(today, []):
-        keep.add(b.path)
+    for identifier, dt in by_day.get(today, []):
+        keep.add(identifier)
 
     # 2) Keep latest from each of previous 3 days
     for delta in (1, 2, 3):
         d = (now.date() - timedelta(days=delta))
         if d in by_day:
-            keep.add(latest(by_day[d]).path)
+            keep.add(latest(by_day[d]))
 
     # 3) Keep latest from previous 2 weeks (excluding current week)
     current_iso_year, current_iso_week, _ = now.isocalendar()
@@ -1249,7 +1261,7 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
 
     for wk in prev_week_keys:
         if wk in by_week:
-            keep.add(latest(by_week[wk]).path)
+            keep.add(latest(by_week[wk]))
 
     # 4) For older backups (anything not already covered), keep latest per month
     # “Older” here means: not today, not in last 3 days, and not in the two previous weeks.
@@ -1260,17 +1272,28 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
         # Determine if this month group contains any backup outside the covered windows.
         # If the month has *only* covered backups, monthly retention isn’t needed.
         has_older = False
-        for b in group:
-            d = b.dt.date()
-            iso_year, iso_week, _ = b.dt.isocalendar()
+        for identifier, dt in group:
+            d = dt.date()
+            iso_year, iso_week, _ = dt.isocalendar()
             if (d not in covered_days) and ((iso_year, iso_week) not in covered_weeks):
                 has_older = True
                 break
 
         if has_older:
-            keep.add(latest(group).path)
+            keep.add(latest(group))
 
-    kept = sorted(list(keep))
+    return keep
+
+def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_run: bool = False) -> tuple[list[Path], list[Path]]:
+    """
+    Returns (kept_paths, deleted_paths)
+    """
+    backups = list_backups(backup_dir)
+    if not backups:
+        return ([], [])
+
+    keep = _select_retained([(b.path, b.dt) for b in backups], now=now)
+    kept = sorted(keep)
     deleted = [b.path for b in backups if b.path not in keep]
 
     if not dry_run:
@@ -1279,6 +1302,45 @@ def apply_backup_retention(backup_dir: Path, now: datetime | None = None, dry_ru
                 p.unlink()
             except Exception as e:
                 print(f"Warning: failed to delete backup {p}: {e}")
+
+    return (kept, deleted)
+
+def list_cloud_backups(cfg: dict, prefix: str = "") -> list[tuple[str, datetime]]:
+    """
+    Mirrors list_backups(): lists cloud objects under prefix, filters by
+    BACKUP_RE against the basename, returns [(full_object_key, dt), ...].
+    """
+    objects = s3_list_objects(cfg, prefix=prefix)
+    items = []
+    for obj in objects:
+        name = obj["key"].rsplit("/", 1)[-1]
+        m = BACKUP_RE.match(name)
+        if not m:
+            continue
+        dt = datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S")
+        items.append((obj["key"], dt))
+    return items
+
+def apply_cloud_backup_retention(cfg: dict, prefix: str = "", now: datetime | None = None, dry_run: bool = False) -> tuple[list[str], list[str]]:
+    """
+    Returns (kept_keys, deleted_keys). Same day/week/month policy as
+    apply_backup_retention (via the shared _select_retained), applied to
+    cloud object keys instead of local paths, deleting via s3_delete().
+    """
+    backups = list_cloud_backups(cfg, prefix=prefix)
+    if not backups:
+        return ([], [])
+
+    keep = _select_retained(backups, now=now)
+    kept = sorted(keep)
+    deleted = [key for key, _dt in backups if key not in keep]
+
+    if not dry_run:
+        for key in deleted:
+            try:
+                s3_delete(cfg, key)
+            except Exception as e:
+                print(f"Warning: failed to delete cloud backup {key}: {e}")
 
     return (kept, deleted)
 
