@@ -84,10 +84,54 @@ def render_screen(title):
     print_section(title)
 
 
-ROOT_DIR = Path("/root")
-COMPOSE_FILE = ROOT_DIR / "docker-compose.yml"
-CONFIG_DIR = ROOT_DIR / "config"
-BACKUP_DIR = ROOT_DIR / "backup"
+# Settings file lives at a fixed location independent of root_dir, since
+# root_dir itself is one of the settings it stores.
+SETTINGS_FILE = Path("/etc/pangolin-updater/settings.json")
+
+DEFAULT_SETTINGS = {
+    "pangolin_edition": "Community",
+    "root_dir": "/root",
+    "backup_path": "",  # empty = derive from root_dir/backup
+    "cloud_backup": {
+        "enabled": False,
+        "provider": "",
+    },
+}
+
+EDITION_OPTIONS = ["Community", "Enterprise"]
+
+def load_settings():
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+    if not SETTINGS_FILE.exists():
+        return merged
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Warning: failed to read settings ({e}); using defaults.")
+        return merged
+    for key in ("pangolin_edition", "root_dir", "backup_path"):
+        if key in data:
+            merged[key] = data[key]
+    if isinstance(data.get("cloud_backup"), dict):
+        merged["cloud_backup"].update(data["cloud_backup"])
+    return merged
+
+def save_settings(settings):
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+SETTINGS = load_settings()
+
+def refresh_paths():
+    """Recompute path globals from SETTINGS. Call after any settings change."""
+    global ROOT_DIR, COMPOSE_FILE, CONFIG_DIR, BACKUP_DIR
+    ROOT_DIR = Path(SETTINGS["root_dir"]).expanduser()
+    COMPOSE_FILE = ROOT_DIR / "docker-compose.yml"
+    CONFIG_DIR = ROOT_DIR / "config"
+    backup_override = SETTINGS.get("backup_path") or ""
+    BACKUP_DIR = Path(backup_override).expanduser() if backup_override else ROOT_DIR / "backup"
+
+refresh_paths()
 BACKUP_RE = re.compile(r"^pangolin-backup-(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.tar\.gz$")
 
 @dataclass(frozen=True)
@@ -907,6 +951,82 @@ def do_restore():
     print("\nRestore complete. Stack restarted.")
 
 
+def settings_edition_select():
+    print("\nPangolin Edition:")
+    for i, opt in enumerate(EDITION_OPTIONS, start=1):
+        marker = " (Current)" if opt == SETTINGS["pangolin_edition"] else ""
+        print(f"  [{i}] {opt}{marker}")
+    val = input(f"Choose number, or type a custom value [blank to keep '{SETTINGS['pangolin_edition']}']: ").strip()
+    if val == "":
+        return
+    if val.isdigit() and 1 <= int(val) <= len(EDITION_OPTIONS):
+        SETTINGS["pangolin_edition"] = EDITION_OPTIONS[int(val) - 1]
+    else:
+        SETTINGS["pangolin_edition"] = val
+    save_settings(SETTINGS)
+    print(f"Edition set to: {SETTINGS['pangolin_edition']}")
+
+def settings_root_directory():
+    val = input(f"\nEnter new Pangolin root directory [blank to keep '{ROOT_DIR}']: ").strip()
+    if val == "":
+        return
+    SETTINGS["root_dir"] = str(Path(val).expanduser())
+    save_settings(SETTINGS)
+    refresh_paths()
+    print(f"Root directory set to: {ROOT_DIR}")
+
+def settings_backup_path():
+    current = SETTINGS.get("backup_path") or ""
+    prompt_current = current if current else f"{ROOT_DIR / 'backup'} (default)"
+    val = input(f"\nEnter new backup path [blank to keep '{prompt_current}', type 'default' to reset]: ").strip()
+    if val == "":
+        return
+    SETTINGS["backup_path"] = "" if val.lower() == "default" else str(Path(val).expanduser())
+    save_settings(SETTINGS)
+    refresh_paths()
+    print(f"Backup path set to: {BACKUP_DIR}")
+
+def settings_cloud_backup():
+    cb = SETTINGS["cloud_backup"]
+    print(f"\nCloud Backup is currently: {'Enabled' if cb.get('enabled') else 'Disabled'}")
+    print("(Provider integration not yet implemented — this only stores your preference.)")
+    val = input("Enable cloud backup? (Y/N) [blank to keep current]: ").strip().lower()
+    if val in ("y", "yes"):
+        cb["enabled"] = True
+    elif val in ("n", "no"):
+        cb["enabled"] = False
+    else:
+        return
+    save_settings(SETTINGS)
+    print(f"Cloud Backup set to: {'Enabled' if cb['enabled'] else 'Disabled'}")
+
+def do_settings():
+    while True:
+        render_screen("Settings")
+        backup_display = str(BACKUP_DIR)
+        if not SETTINGS.get("backup_path"):
+            backup_display += "  (default)"
+        cb_display = "Enabled" if SETTINGS["cloud_backup"].get("enabled") else "Disabled"
+        print(f"[1] Pangolin Edition Select   (current: {SETTINGS['pangolin_edition']})")
+        print(f"[2] Pangolin Root Directory   (current: {ROOT_DIR})")
+        print(f"[3] Backup Path               (current: {backup_display})")
+        print(f"[4] Cloud Backup              (current: {cb_display})")
+        print("[5] Back to Main Menu")
+        choice = input("Select an option [1-5]: ").strip()
+
+        if choice == "1":
+            settings_edition_select()
+        elif choice == "2":
+            settings_root_directory()
+        elif choice == "3":
+            settings_backup_path()
+        elif choice == "4":
+            settings_cloud_backup()
+        elif choice == "5":
+            return
+        else:
+            print("Invalid option.")
+
 def main():
     handle_cli_flags()
     require_root()
@@ -916,8 +1036,9 @@ def main():
         print("[1] Backup stack and config")
         print("[2] Update image versions")
         print("[3] Restore from backup")
-        print("[4] Close")
-        choice = input("Select an option [1-4]: ").strip()
+        print("[4] Settings")
+        print("[5] Close")
+        choice = input("Select an option [1-5]: ").strip()
 
         if choice == "1":
             do_backup()
@@ -926,6 +1047,8 @@ def main():
         elif choice == "3":
             do_restore()
         elif choice == "4":
+            do_settings()
+        elif choice == "5":
             print("Bye.")
             return
         else:
