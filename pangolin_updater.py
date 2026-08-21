@@ -162,6 +162,16 @@ IMAGES = {
     },
 }
 
+# Traefik major-version lock: per Pangolin maintainer guidance, Traefik should
+# stay pinned to v3 until Pangolin's own compatibility guidance says otherwise.
+# This is fetched from the repo at update time so the lock can be lifted
+# (see TRAEFIK_LOCK_FILE_NAME) without shipping a new updater release.
+TRAEFIK_LOCK_URL = "https://raw.githubusercontent.com/davetech-dev/Pangolin-Updater/main/traefik-version-lock.json"
+DEFAULT_TRAEFIK_LOCK = {
+    "current_traefik_version_tag": "v3",
+    "pangolin_last_update_for_traefik_update_to_v4": "",
+}
+
 def handle_cli_flags():
     if len(sys.argv) <= 1:
         return
@@ -369,6 +379,26 @@ def style_current_tag(tag):
         return f"\033[1m{tag}\033[0m"
     return tag
 
+def fetch_traefik_lock(timeout=10):
+    """
+    Fetches the Traefik major-version lock from the repo. Falls back to the
+    hardcoded default (locked to v3) if the fetch fails for any reason.
+    """
+    lock = dict(DEFAULT_TRAEFIK_LOCK)
+    try:
+        req = urllib.request.Request(
+            TRAEFIK_LOCK_URL,
+            headers={"User-Agent": f"{__app_name__}/{__version__}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for key in DEFAULT_TRAEFIK_LOCK:
+            if data.get(key):
+                lock[key] = data[key]
+    except Exception as e:
+        print(f"  Warning: failed to fetch Traefik version lock ({e}); using local default ({lock['current_traefik_version_tag']}).")
+    return lock
+
 def fetch_github_release_tags(github_repo, per_page=100, timeout=10):
     url = f"https://api.github.com/repos/{github_repo}/releases?per_page={per_page}"
     req = urllib.request.Request(
@@ -427,11 +457,25 @@ def safe_extract_tar(tar, destination: Path):
     for member in safe_members:
         tar.extract(member, path=base_dir)
 
-def select_release_tag(meta, current_tag):
+def select_release_tag(meta, current_tag, major_version_lock=None, annotate_from_tag=None):
     display = meta["display"]
     github_repo = meta.get("github_repo")
     release_url = meta.get("release_url")
     upgrade_note = meta.get("upgrade_note")
+
+    def annotation_for(tag):
+        if not annotate_from_tag:
+            return ""
+        threshold = parse_version_tuple(annotate_from_tag)
+        tt = parse_version_tuple(tag)
+        if threshold is None or tt is None:
+            return ""
+        max_len = max(len(threshold), len(tt))
+        t_pad = threshold + (0,) * (max_len - len(threshold))
+        v_pad = tt + (0,) * (max_len - len(tt))
+        if v_pad >= t_pad:
+            return "  [!] Requires updating Traefik to v4"
+        return ""
 
     if current_tag is None:
         val = input(f"Enter {display} version tag to pin (current not detected) [leave blank to keep]: ").strip()
@@ -442,6 +486,8 @@ def select_release_tag(meta, current_tag):
         print(f"  Releases: {release_url}")
     if upgrade_note:
         print(f"  NOTE: {upgrade_note}")
+    if major_version_lock:
+        print(f"  NOTE: Locked to {major_version_lock}.x per Pangolin maintainer guidance. Only that major version is offered below.")
 
     if not github_repo:
         print("  Release source not configured.")
@@ -479,6 +525,14 @@ def select_release_tag(meta, current_tag):
         seen.add(tag)
         unique_tags.append(tag)
 
+    if major_version_lock:
+        locked_major = parse_version_tuple(major_version_lock)
+        if locked_major is not None:
+            unique_tags = [
+                t for t in unique_tags
+                if parse_version_tuple(t) is not None and parse_version_tuple(t)[0] == locked_major[0]
+            ]
+
     # If current tag is non-semver-like (e.g. "latest"), still show stable
     # release options so users can pick a concrete version from the menu.
     current_parsed = parse_version_tuple(current_tag)
@@ -501,17 +555,17 @@ def select_release_tag(meta, current_tag):
     idx = 1
     for tag in upgrades:
         option_map[idx] = tag
-        print(f"  [{idx}] {tag} (Upgrade)")
+        print(f"  [{idx}] {tag} (Upgrade){annotation_for(tag)}")
         idx += 1
 
     current_idx = idx
     option_map[current_idx] = current_tag
-    print(f"  [{current_idx}] {style_current_tag(current_tag)} (Current)")
+    print(f"  [{current_idx}] {style_current_tag(current_tag)} (Current){annotation_for(current_tag)}")
     idx += 1
 
     if one_downgrade is not None:
         option_map[idx] = one_downgrade
-        print(f"  [{idx}] {one_downgrade} (Downgrade)")
+        print(f"  [{idx}] {one_downgrade} (Downgrade){annotation_for(one_downgrade)}")
 
     if len(upgrades) == 0:
         print("  No stable upgrades found; keeping current is recommended.")
@@ -708,11 +762,18 @@ def do_update():
         print("Detected tags:", current)
 
     print("\nChecking GitHub releases and preparing version choices...")
+    traefik_lock = fetch_traefik_lock()
 
     selections = {}
     for key, meta in IMAGES.items():
         old = current.get(key)
-        selections[key] = select_release_tag(meta, old)
+        major_version_lock = traefik_lock["current_traefik_version_tag"] if key == "traefik" else None
+        annotate_from_tag = traefik_lock["pangolin_last_update_for_traefik_update_to_v4"] if key == "pangolin" else None
+        selections[key] = select_release_tag(
+            meta, old,
+            major_version_lock=major_version_lock,
+            annotate_from_tag=annotate_from_tag,
+        )
 
     print("\nPlanned changes:")
     any_changes = False
