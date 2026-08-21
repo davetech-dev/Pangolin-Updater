@@ -926,6 +926,11 @@ def _send_notification_payload(n: dict, success: bool, summary: str, timeout: fl
         }).encode("utf-8")
         headers = {"Content-Type": "application/json"}
 
+    # Some providers (Discord's Cloudflare front-end in particular) reject
+    # requests with no User-Agent as bot traffic, regardless of payload
+    # validity — set one, matching every other outbound request in this file.
+    headers["User-Agent"] = f"{__app_name__}/{__version__}"
+
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         resp.read()
